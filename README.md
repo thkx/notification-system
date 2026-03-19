@@ -56,7 +56,7 @@ notification-system/
 1. **克隆代码**
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/thkx/notification-system.git
 cd notification-system
 ```
 
