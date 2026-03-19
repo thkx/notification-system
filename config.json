@@ -1,0 +1,34 @@
+{
+  "server": {
+    "port": 8080
+  },
+  "router": {
+    "bufferSize": 1000,
+    "workerCount": 3,
+    "maxRetries": 3,
+    "retryDelayMs": 100
+  },
+  "channels": {
+    "email": {
+      "enabled": true
+    },
+    "sms": {
+      "enabled": true
+    },
+    "inapp": {
+      "enabled": true
+    },
+    "social_media": {
+      "enabled": true
+    }
+  },
+  "metrics": {
+    "maxFailureRate": 0.2,
+    "maxQueueUtilization": 0.8,
+    "maxProcessingTime": 5000
+  },
+  "distribution": {
+    "deduplicationTTL": 60
+  },
+  "environment": "development"
+}
