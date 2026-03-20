@@ -5,6 +5,7 @@ import (
 
 	"github.com/thkx/notification-system/internal/distribution"
 	"github.com/thkx/notification-system/internal/router"
+	"github.com/thkx/notification-system/internal/storage"
 	"github.com/thkx/notification-system/pkg/model"
 )
 
@@ -30,7 +31,7 @@ func TestGatewaySingleNotification(t *testing.T) {
 	notificationRouter.RegisterChannel("mock", mockChannel)
 
 	dist := distribution.NewDistribution(notificationRouter)
-	gateway := NewGateway(dist)
+	gateway := NewGateway(dist, storage.NewMemoryStore())
 
 	notification := &model.Notification{
 		ID:       "test-1",
@@ -51,7 +52,7 @@ func TestGatewaySingleNotification(t *testing.T) {
 func TestGatewayNilNotification(t *testing.T) {
 	notificationRouter := router.NewRouter()
 	dist := distribution.NewDistribution(notificationRouter)
-	gateway := NewGateway(dist)
+	gateway := NewGateway(dist, storage.NewMemoryStore())
 
 	err := gateway.SendNotification(nil)
 	if err == nil {
@@ -63,7 +64,7 @@ func TestGatewayNilNotification(t *testing.T) {
 func TestGatewayEmptyUserID(t *testing.T) {
 	notificationRouter := router.NewRouter()
 	dist := distribution.NewDistribution(notificationRouter)
-	gateway := NewGateway(dist)
+	gateway := NewGateway(dist, storage.NewMemoryStore())
 
 	notification := &model.Notification{
 		ID:       "test-1",
@@ -83,7 +84,7 @@ func TestGatewayEmptyUserID(t *testing.T) {
 func TestGatewayNoChannels(t *testing.T) {
 	notificationRouter := router.NewRouter()
 	dist := distribution.NewDistribution(notificationRouter)
-	gateway := NewGateway(dist)
+	gateway := NewGateway(dist, storage.NewMemoryStore())
 
 	notification := &model.Notification{
 		ID:       "test-1",
@@ -106,7 +107,7 @@ func TestGatewayBatchNotifications(t *testing.T) {
 	notificationRouter.RegisterChannel("mock", mockChannel)
 
 	dist := distribution.NewDistribution(notificationRouter)
-	gateway := NewGateway(dist)
+	gateway := NewGateway(dist, storage.NewMemoryStore())
 
 	notifications := []*model.Notification{
 		{
@@ -158,7 +159,7 @@ func TestGatewayBatchNotifications(t *testing.T) {
 func TestGatewayBatchEmptyList(t *testing.T) {
 	notificationRouter := router.NewRouter()
 	dist := distribution.NewDistribution(notificationRouter)
-	gateway := NewGateway(dist)
+	gateway := NewGateway(dist, storage.NewMemoryStore())
 
 	result, err := gateway.SendBatchNotifications([]*model.Notification{})
 	if err != nil {
@@ -177,7 +178,7 @@ func TestGatewayBatchPartialFailure(t *testing.T) {
 	notificationRouter.RegisterChannel("mock", mockChannel)
 
 	dist := distribution.NewDistribution(notificationRouter)
-	gateway := NewGateway(dist)
+	gateway := NewGateway(dist, storage.NewMemoryStore())
 
 	notifications := []*model.Notification{
 		{

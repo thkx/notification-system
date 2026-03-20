@@ -1,12 +1,17 @@
 package model
 
+import "time"
+
 // Notification 通知结构，定义了通知的基本信息
 type Notification struct {
-	ID        string   // 通知ID
-	UserID    string   // 用户ID
-	Type      string   // 通知类型
-	Content   string   // 通知内容
-	Channels  []string // 通知渠道列表
-	Priority  int      // 通知优先级
-	Scheduled string   // 调度时间
+	ID        string    // 通知ID
+	UserID    string    // 用户ID
+	Type      string    // 通知类型
+	Content   string    // 通知内容
+	Channels  []string  // 通知渠道列表
+	Priority  int       // 通知优先级
+	Scheduled string    // 调度时间
+	Status    string    // 通知状态（pending/processing/sent/failed）
+	CreatedAt time.Time // 创建时间
+	UpdatedAt time.Time // 更新时间
 }

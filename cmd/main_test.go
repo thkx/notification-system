@@ -9,6 +9,7 @@ import (
 	"github.com/thkx/notification-system/internal/gateway"
 	"github.com/thkx/notification-system/internal/router"
 	"github.com/thkx/notification-system/internal/services"
+	"github.com/thkx/notification-system/internal/storage"
 	"github.com/thkx/notification-system/pkg/model"
 )
 
@@ -26,7 +27,7 @@ func TestNotificationSystem(t *testing.T) {
 	router.RegisterChannel("social", socialMediaChannel)
 
 	distribution := distribution.NewDistribution(router)
-	notificationGateway := gateway.NewGateway(distribution)
+	notificationGateway := gateway.NewGateway(distribution, storage.NewMemoryStore())
 
 	orderService := services.NewOrderService(notificationGateway)
 	paymentService := services.NewPaymentService(notificationGateway)

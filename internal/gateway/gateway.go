@@ -4,9 +4,11 @@ import (
 	"fmt"
 
 	"github.com/thkx/notification-system/internal/distribution"
+	"github.com/thkx/notification-system/internal/storage"
 	"github.com/thkx/notification-system/pkg/errors"
 	"github.com/thkx/notification-system/pkg/logger"
 	"github.com/thkx/notification-system/pkg/model"
+	"github.com/thkx/notification-system/pkg/retry"
 )
 
 // BatchResult 批量发送结果
@@ -21,14 +23,17 @@ type BatchResult struct {
 // Gateway 通知网关，处理单个和批量通知的发送
 type Gateway struct {
 	distribution *distribution.Distribution // 分发组件，负责通知的处理和路由
+	store        storage.NotificationStore  // 持久化存储接口
 }
 
 // NewGateway 创建一个新的Gateway实例
 // @param distribution 分发组件实例
+// @param store 通知持久化存储
 // @return 新创建的Gateway实例
-func NewGateway(distribution *distribution.Distribution) *Gateway {
+func NewGateway(distribution *distribution.Distribution, store storage.NotificationStore) *Gateway {
 	return &Gateway{
 		distribution: distribution,
+		store:        store,
 	}
 }
 
@@ -62,15 +67,70 @@ func (g *Gateway) SendNotification(notification *model.Notification) error {
 
 	// 直接使用model.Notification，无需转换
 
-	// 调用分发组件处理通知
-	if err := g.distribution.ProcessNotification(notification); err != nil {
+	if g.store != nil {
+		if notification.Status == "" {
+			notification.Status = "pending"
+		}
+		if err := g.store.Save(notification); err != nil {
+			logger.Error("Failed to persist notification: ID=%s, Error=%v", notification.ID, err)
+		}
+		if err := g.store.UpdateStatus(notification.ID, "processing"); err != nil {
+			logger.Warn("Failed to update notification status to processing: ID=%s, Error=%v", notification.ID, err)
+		}
+	}
+
+	// 调用分发组件处理通知，使用重试策略避免瞬时故障
+	err := retry.Do(func() error {
+		return g.distribution.ProcessNotification(notification)
+	}, retry.DefaultRetryConfig())
+	if err != nil {
+		if g.store != nil {
+			if updateErr := g.store.UpdateStatus(notification.ID, "failed"); updateErr != nil {
+				logger.Warn("Failed to update notification status to failed: ID=%s, Error=%v", notification.ID, updateErr)
+			}
+		}
+
+		if appErr, ok := err.(*errors.AppError); ok && appErr.Type == errors.ErrorTypeDistribution && appErr.Message == "Duplicate notification" {
+			if g.store != nil {
+				if updateErr := g.store.UpdateStatus(notification.ID, "duplicate"); updateErr != nil {
+					logger.Warn("Failed to update notification status to duplicate: ID=%s, Error=%v", notification.ID, updateErr)
+				}
+			}
+			logger.Info("Duplicate notification ignored: ID=%s", notification.ID)
+			return nil
+		}
+
 		wrappedErr := errors.GatewayError("Failed to send notification", fmt.Sprintf("Notification ID: %s", notification.ID), err)
 		logger.Error("Failed to send notification: %v", wrappedErr)
 		return wrappedErr
 	}
 
+	if g.store != nil {
+		if err := g.store.UpdateStatus(notification.ID, "sent"); err != nil {
+			logger.Warn("Failed to update notification status to sent: ID=%s, Error=%v", notification.ID, err)
+		}
+	}
+
 	logger.Info("Notification sent successfully: ID=%s", notification.ID)
 	return nil
+}
+
+// GetNotificationByID 根据通知ID读取通知状态
+func (g *Gateway) GetNotificationByID(notificationID string) (*model.Notification, error) {
+	if g.store == nil {
+		return nil, fmt.Errorf("no storage configured")
+	}
+	if notificationID == "" {
+		return nil, fmt.Errorf("notificationID cannot be empty")
+	}
+	return g.store.GetByID(notificationID)
+}
+
+func (g *Gateway) ListNotifications(filter storage.NotificationFilter) ([]*model.Notification, error) {
+	if g.store == nil {
+		return nil, fmt.Errorf("no storage configured")
+	}
+	return g.store.List(filter)
 }
 
 // SendBatchNotifications 批量发送通知，返回详细的批量结果
@@ -136,8 +196,8 @@ func (g *Gateway) SendBatchNotifications(notifications []*model.Notification) (*
 				continue
 			}
 
-			// 调用分发组件处理通知
-			if err := g.distribution.ProcessNotification(notification); err != nil {
+			// 调用网关发送单条通知（包含持久化和状态更新）
+			if err := g.SendNotification(notification); err != nil {
 				result.Failed++
 				result.FailedIDs = append(result.FailedIDs, notification.ID)
 				wrappedErr := errors.GatewayError("Failed to send batch notification",

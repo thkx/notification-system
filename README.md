@@ -88,6 +88,23 @@ go run cmd/main.go
 
 ### 配置说明
 
+#### PostgreSQL 支持
+
+如果使用 `storage.type` 设为 `postgres`，应在 `config.*.json` 加入：
+
+```json
+"storage": {
+  "type": "postgres",
+  "dsn": "postgres://notification:notification@localhost:5432/notificationdb?sslmode=disable"
+}
+```
+
+可启动 PostgreSQL：
+
+```bash
+docker compose -f docker-compose.postgres.yml up -d
+```
+
 配置文件示例：
 
 ```json
@@ -116,10 +133,23 @@ go run cmd/main.go
 ### 环境变量
 
 - `NOTIFICATION_ENV`：运行环境，默认为 `development`
+- `EMAIL_PROVIDER`：邮件供应商（`memory` / `sendgrid`），默认 `memory`
+- `SENDGRID_API_KEY`：SendGrid API Key（可选）
+- `SMS_PROVIDER`：短信供应商（`memory` / `twilio`），默认 `memory`
+- `TWILIO_ACCOUNT_SID` / `TWILIO_AUTH_TOKEN`：Twilio 认证信息（可选）
 
 ## API 文档
 
 ### 通知网关
+
+#### 查询通知列表
+
+- `GET /api/notifications?userId={userId}&status={status}`
+- `userId` 和 `status` 可选，支持按用户和状态过滤
+
+#### 查看单条通知
+
+- `GET /api/notifications/{id}`
 
 #### 发送单个通知
 

@@ -113,7 +113,7 @@ func (d *Distribution) ProcessNotification(notification *model.Notification) err
 	// 0. 检查重复（去重与幂等性）
 	if d.cache.IsProcessed(notification.ID) {
 		logger.Warn("Duplicate notification detected: ID=%s, skipping", notification.ID)
-		return nil // 返回成功但不重复处理
+		return errors.DistributionError("Duplicate notification", "Notification already processed", nil)
 	}
 
 	// 1. 验证通知的合法性

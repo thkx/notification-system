@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/thkx/notification-system/internal/gateway"
+	"github.com/thkx/notification-system/internal/storage"
 	"github.com/thkx/notification-system/pkg/model"
 
 	"github.com/gorilla/mux"
@@ -51,7 +52,9 @@ func (s *Server) setupRoutes() {
 	notificationRoutes := s.router.PathPrefix("/api/notifications").Subrouter()
 	{
 		notificationRoutes.HandleFunc("", s.sendNotification).Methods("POST")
+		notificationRoutes.HandleFunc("", s.listNotifications).Methods("GET")
 		notificationRoutes.HandleFunc("/batch", s.sendBatchNotifications).Methods("POST")
+		notificationRoutes.HandleFunc("/{id}", s.getNotificationByID).Methods("GET")
 	}
 
 	// WebSocket路由
@@ -144,6 +147,58 @@ func (s *Server) sendBatchNotifications(w http.ResponseWriter, r *http.Request) 
 		"status": "success",
 		"result": result,
 	})
+}
+
+// getNotificationByID 查询单条通知状态
+func (s *Server) getNotificationByID(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id := vars["id"]
+	if id == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "id is required"})
+		return
+	}
+
+	notification, err := s.gateway.GetNotificationByID(id)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	if notification == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]string{"error": "notification not found"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(notification)
+}
+
+// listNotifications 查询通知列表
+func (s *Server) listNotifications(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query()
+	filter := storage.NotificationFilter{
+		UserID: query.Get("userId"),
+		Status: query.Get("status"),
+	}
+
+	notifications, err := s.gateway.ListNotifications(filter)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(notifications)
 }
 
 // handleWebSocket 处理WebSocket连接

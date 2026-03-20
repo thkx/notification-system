@@ -17,6 +17,7 @@ import (
 	"github.com/thkx/notification-system/internal/gateway"
 	"github.com/thkx/notification-system/internal/router"
 	"github.com/thkx/notification-system/internal/services"
+	"github.com/thkx/notification-system/internal/storage"
 	"github.com/thkx/notification-system/pkg/di"
 	"github.com/thkx/notification-system/pkg/metrics"
 	"github.com/thkx/notification-system/pkg/model"
@@ -84,12 +85,27 @@ func main() {
 	}
 	container.Register("router", notificationRouter)
 
+	// 初始化持久化存储（可选择 memory/postgres）
+	var store storage.NotificationStore
+	if cfg.Store.Type == "postgres" {
+		pgStore, err := storage.NewPostgresStore(cfg.Store.DSN)
+		if err != nil {
+			fmt.Printf("Failed to initialize PostgreSQL store: %v, falling back to memory store\n", err)
+			store = storage.NewMemoryStore()
+		} else {
+			store = pgStore
+		}
+	} else {
+		store = storage.NewMemoryStore()
+	}
+	container.Register("store", store)
+
 	// 初始化分发器
 	distribution := distribution.NewDistributionWithTTL(notificationRouter, cfg.Distribution.DeduplicationTTL)
 	container.Register("distribution", distribution)
 
 	// 初始化网关
-	notificationGateway := gateway.NewGateway(distribution)
+	notificationGateway := gateway.NewGateway(distribution, store)
 	container.Register("gateway", notificationGateway)
 
 	// 初始化HTTP服务器

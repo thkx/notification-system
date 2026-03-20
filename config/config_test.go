@@ -143,6 +143,18 @@ func TestConfigValidation(t *testing.T) {
 				Router:       RouterConfig{BufferSize: 0, WorkerCount: 3, MaxRetries: 3, RetryDelayMs: 100},
 				Metrics:      MetricsConfig{MaxFailureRate: 0.2, MaxQueueUtilization: 0.8, MaxProcessingTime: 5000},
 				Distribution: DistributionConfig{DeduplicationTTL: 60},
+				Store:        StoreConfig{Type: "memory"},
+			},
+			true,
+		},
+		{
+			"Invalid store type",
+			Config{
+				Server:       ServerConfig{Port: 8080},
+				Router:       RouterConfig{BufferSize: 1000, WorkerCount: 3, MaxRetries: 3, RetryDelayMs: 100},
+				Metrics:      MetricsConfig{MaxFailureRate: 0.2, MaxQueueUtilization: 0.8, MaxProcessingTime: 5000},
+				Distribution: DistributionConfig{DeduplicationTTL: 60},
+				Store:        StoreConfig{Type: "unknown"},
 			},
 			true,
 		},

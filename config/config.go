@@ -48,6 +48,12 @@ type DistributionConfig struct {
 	DeduplicationTTL int `json:"deduplicationTTL"` // 去重缓存TTL(秒)，默认60
 }
 
+// StoreConfig 存储配置
+type StoreConfig struct {
+	Type string `json:"type"` // 存储类型: memory/postgres
+	DSN  string `json:"dsn"`  // PostgreSQL 连接字符串，仅当 Type=postgres 时必填
+}
+
 // Config 系统总配置结构
 type Config struct {
 	Server       ServerConfig       `json:"server"`       // 服务器配置
@@ -55,6 +61,7 @@ type Config struct {
 	Channels     ChannelsConfig     `json:"channels"`     // 渠道配置
 	Metrics      MetricsConfig      `json:"metrics"`      // 性能监控配置
 	Distribution DistributionConfig `json:"distribution"` // 分发配置
+	Store        StoreConfig        `json:"store"`        // 存储配置
 	Environment  string             `json:"environment"`  // 运行环境
 }
 
@@ -74,6 +81,23 @@ func (c *Config) Validate() error {
 	}
 	if err := c.Distribution.Validate(); err != nil {
 		return fmt.Errorf("distribution config validation failed: %w", err)
+	}
+	if err := c.Store.Validate(); err != nil {
+		return fmt.Errorf("storage config validation failed: %w", err)
+	}
+	return nil
+}
+
+// Validate 验证存储配置
+func (s *StoreConfig) Validate() error {
+	if s.Type == "" {
+		s.Type = "memory"
+	}
+	if s.Type != "memory" && s.Type != "postgres" {
+		return fmt.Errorf("unsupported storage type: %s", s.Type)
+	}
+	if s.Type == "postgres" && s.DSN == "" {
+		return fmt.Errorf("postgres storage requires dsn")
 	}
 	return nil
 }
@@ -285,6 +309,10 @@ func getDefaultConfig() *Config {
 		},
 		Distribution: DistributionConfig{
 			DeduplicationTTL: 60, // 默认去重缓存TTL 60秒
+		},
+		Store: StoreConfig{
+			Type: "memory", // 默认内存存储
+			DSN:  "",
 		},
 		Environment: "development", // 默认环境为开发环境
 	}
