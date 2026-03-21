@@ -2,6 +2,7 @@ package storage
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -52,8 +53,7 @@ func (s *MemoryStore) Save(notification *model.Notification) error {
 
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	copy := *notification
-	s.notifications[notification.ID] = &copy
+	s.notifications[notification.ID] = cloneNotification(notification)
 	return nil
 }
 
@@ -90,16 +90,13 @@ func (s *MemoryStore) GetByID(notificationID string) (*model.Notification, error
 		return nil, nil
 	}
 
-	notificationCopy := *notification
-	return &notificationCopy, nil
+	return cloneNotification(notification), nil
 }
 
 // List 返回符合过滤条件的通知
 func (s *MemoryStore) List(filter NotificationFilter) ([]*model.Notification, error) {
-	result := make([]*model.Notification, 0)
-
 	s.mutex.RLock()
-	defer s.mutex.RUnlock()
+	matches := make([]*model.Notification, 0, len(s.notifications))
 
 	for _, notification := range s.notifications {
 		if filter.UserID != "" && notification.UserID != filter.UserID {
@@ -109,9 +106,37 @@ func (s *MemoryStore) List(filter NotificationFilter) ([]*model.Notification, er
 			continue
 		}
 
-		notificationCopy := *notification
-		result = append(result, &notificationCopy)
+		matches = append(matches, notification)
+	}
+	s.mutex.RUnlock()
+
+	sort.Slice(matches, func(i, j int) bool {
+		if !matches[i].CreatedAt.Equal(matches[j].CreatedAt) {
+			return matches[i].CreatedAt.After(matches[j].CreatedAt)
+		}
+		if !matches[i].UpdatedAt.Equal(matches[j].UpdatedAt) {
+			return matches[i].UpdatedAt.After(matches[j].UpdatedAt)
+		}
+		return matches[i].ID < matches[j].ID
+	})
+
+	result := make([]*model.Notification, 0, len(matches))
+	for _, notification := range matches {
+		result = append(result, cloneNotification(notification))
 	}
 
 	return result, nil
+}
+
+func cloneNotification(notification *model.Notification) *model.Notification {
+	if notification == nil {
+		return nil
+	}
+
+	notificationCopy := *notification
+	if notification.Channels != nil {
+		notificationCopy.Channels = append([]string(nil), notification.Channels...)
+	}
+
+	return &notificationCopy
 }

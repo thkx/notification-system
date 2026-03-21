@@ -7,8 +7,11 @@ import (
 	"strings"
 	"time"
 
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/thkx/notification-system/pkg/model"
 )
+
+const postgresOperationTimeout = 5 * time.Second
 
 // PostgresStore PostgreSQL实现的通知存储
 type PostgresStore struct {
@@ -21,24 +24,37 @@ func NewPostgresStore(dsn string) (*PostgresStore, error) {
 		return nil, fmt.Errorf("dsn cannot be empty")
 	}
 
-	db, err := sql.Open("postgres", dsn)
+	db, err := sql.Open("pgx", dsn)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := db.Ping(); err != nil {
+	store := &PostgresStore{db: db}
+	if err := store.ping(); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 
-	store := &PostgresStore{db: db}
 	if err := store.ensureSchema(); err != nil {
+		_ = db.Close()
 		return nil, err
 	}
 
 	return store, nil
 }
 
+// Close 释放底层数据库连接
+func (s *PostgresStore) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
+}
+
 func (s *PostgresStore) ensureSchema() error {
+	ctx, cancel := context.WithTimeout(context.Background(), postgresOperationTimeout)
+	defer cancel()
+
 	query := `
 CREATE TABLE IF NOT EXISTS notifications (
 	id TEXT PRIMARY KEY,
@@ -51,8 +67,15 @@ CREATE TABLE IF NOT EXISTS notifications (
 	status TEXT,
 	created_at TIMESTAMPTZ,
 	updated_at TIMESTAMPTZ
-);`
-	_, err := s.db.Exec(query)
+);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_user_status_created_at
+	ON notifications (user_id, status, created_at DESC, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_status_created_at
+	ON notifications (status, created_at DESC, updated_at DESC);
+`
+	_, err := s.db.ExecContext(ctx, query)
 	return err
 }
 
@@ -71,12 +94,10 @@ func (s *PostgresStore) Save(notification *model.Notification) error {
 	}
 	notification.UpdatedAt = now
 
-	channels := ""
-	if len(notification.Channels) > 0 {
-		channels = strings.Join(notification.Channels, ",")
-	}
+	ctx, cancel := context.WithTimeout(context.Background(), postgresOperationTimeout)
+	defer cancel()
 
-	_, err := s.db.ExecContext(context.Background(), `
+	_, err := s.db.ExecContext(ctx, `
 INSERT INTO notifications (id, user_id, type, content, channels, priority, scheduled, status, created_at, updated_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 ON CONFLICT (id) DO UPDATE SET
@@ -92,7 +113,7 @@ ON CONFLICT (id) DO UPDATE SET
 		notification.UserID,
 		notification.Type,
 		notification.Content,
-		channels,
+		serializeChannels(notification.Channels),
 		notification.Priority,
 		notification.Scheduled,
 		notification.Status,
@@ -107,11 +128,27 @@ func (s *PostgresStore) UpdateStatus(notificationID string, status string) error
 	if notificationID == "" {
 		return fmt.Errorf("notificationID cannot be empty")
 	}
-	_, err := s.db.ExecContext(context.Background(), `
+
+	ctx, cancel := context.WithTimeout(context.Background(), postgresOperationTimeout)
+	defer cancel()
+
+	result, err := s.db.ExecContext(ctx, `
 UPDATE notifications SET status=$1, updated_at=$2 WHERE id=$3`,
 		status, time.Now().UTC(), notificationID,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rowsAffected == 0 {
+		return fmt.Errorf("notification not found: %s", notificationID)
+	}
+
+	return nil
 }
 
 // GetByID 查询通知
@@ -120,9 +157,12 @@ func (s *PostgresStore) GetByID(notificationID string) (*model.Notification, err
 		return nil, fmt.Errorf("notificationID cannot be empty")
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), postgresOperationTimeout)
+	defer cancel()
+
 	n := &model.Notification{}
 	var channelsStr sql.NullString
-	row := s.db.QueryRowContext(context.Background(), `
+	row := s.db.QueryRowContext(ctx, `
 SELECT id, user_id, type, content, channels, priority, scheduled, status, created_at, updated_at
 FROM notifications WHERE id=$1`, notificationID)
 
@@ -133,18 +173,47 @@ FROM notifications WHERE id=$1`, notificationID)
 		return nil, err
 	}
 
-	if channelsStr.Valid && channelsStr.String != "" {
-		n.Channels = strings.Split(channelsStr.String, ",")
-	}
-
+	n.Channels = deserializeChannels(channelsStr)
 	return n, nil
 }
 
 // List 返回符合过滤条件的通知
 func (s *PostgresStore) List(filter NotificationFilter) ([]*model.Notification, error) {
+	query, args := buildNotificationListQuery(filter)
+
+	ctx, cancel := context.WithTimeout(context.Background(), postgresOperationTimeout)
+	defer cancel()
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	result := make([]*model.Notification, 0)
+	for rows.Next() {
+		n := &model.Notification{}
+		var channelsStr sql.NullString
+		if err := rows.Scan(&n.ID, &n.UserID, &n.Type, &n.Content, &channelsStr, &n.Priority, &n.Scheduled, &n.Status, &n.CreatedAt, &n.UpdatedAt); err != nil {
+			return nil, err
+		}
+		n.Channels = deserializeChannels(channelsStr)
+		result = append(result, n)
+	}
+
+	return result, rows.Err()
+}
+
+func (s *PostgresStore) ping() error {
+	ctx, cancel := context.WithTimeout(context.Background(), postgresOperationTimeout)
+	defer cancel()
+	return s.db.PingContext(ctx)
+}
+
+func buildNotificationListQuery(filter NotificationFilter) (string, []interface{}) {
 	query := "SELECT id, user_id, type, content, channels, priority, scheduled, status, created_at, updated_at FROM notifications"
-	clauses := []string{}
-	args := []interface{}{}
+	clauses := make([]string, 0, 2)
+	args := make([]interface{}, 0, 2)
 
 	if filter.UserID != "" {
 		clauses = append(clauses, fmt.Sprintf("user_id = $%d", len(args)+1))
@@ -159,24 +228,20 @@ func (s *PostgresStore) List(filter NotificationFilter) ([]*model.Notification, 
 		query += " WHERE " + strings.Join(clauses, " AND ")
 	}
 
-	rows, err := s.db.QueryContext(context.Background(), query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+	query += " ORDER BY created_at DESC, updated_at DESC, id ASC"
+	return query, args
+}
 
-	result := make([]*model.Notification, 0)
-	for rows.Next() {
-		n := &model.Notification{}
-		var channelsStr sql.NullString
-		if err := rows.Scan(&n.ID, &n.UserID, &n.Type, &n.Content, &channelsStr, &n.Priority, &n.Scheduled, &n.Status, &n.CreatedAt, &n.UpdatedAt); err != nil {
-			return nil, err
-		}
-		if channelsStr.Valid && channelsStr.String != "" {
-			n.Channels = strings.Split(channelsStr.String, ",")
-		}
-		result = append(result, n)
+func serializeChannels(channels []string) string {
+	if len(channels) == 0 {
+		return ""
 	}
+	return strings.Join(channels, ",")
+}
 
-	return result, rows.Err()
+func deserializeChannels(channels sql.NullString) []string {
+	if !channels.Valid || channels.String == "" {
+		return nil
+	}
+	return strings.Split(channels.String, ",")
 }

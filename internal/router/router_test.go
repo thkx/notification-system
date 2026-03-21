@@ -2,6 +2,8 @@ package router
 
 import (
 	"context"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -10,15 +12,18 @@ import (
 
 // MockChannelRouter 模拟通知渠道
 type MockChannelRouter struct {
-	sendCount  int
+	sendCount  atomic.Int32
 	shouldFail bool
 	delay      time.Duration
 }
 
 func (m *MockChannelRouter) Send(notification *model.Notification) error {
-	m.sendCount++
+	m.sendCount.Add(1)
 	if m.delay > 0 {
 		time.Sleep(m.delay)
+	}
+	if m.shouldFail {
+		return fmt.Errorf("mock send failure")
 	}
 	return nil
 }
@@ -49,15 +54,13 @@ func TestRouterBasicRouting(t *testing.T) {
 		Channels: []string{"mock"},
 	}
 
-	err := router.RouteNotification(notification)
-	if err != nil {
+	if err := router.RouteNotification(notification); err != nil {
 		t.Fatalf("Failed to route notification: %v", err)
 	}
 
-	// 等待异步处理
 	time.Sleep(100 * time.Millisecond)
 
-	if mockChannel.sendCount == 0 {
+	if mockChannel.sendCount.Load() == 0 {
 		t.Errorf("Expected channel.Send to be called, but it wasn't")
 	}
 }
@@ -77,29 +80,25 @@ func TestRouterQueueCapacity(t *testing.T) {
 	mockChannel := &MockChannelRouter{delay: 50 * time.Millisecond}
 	router.RegisterChannel("mock", mockChannel)
 
-	// 填满队列
 	for i := 0; i < 5; i++ {
 		notif := &model.Notification{
-			ID:       string(rune(i)) + "test",
+			ID:       fmt.Sprintf("test-%d", i),
 			UserID:   "user1",
 			Content:  "test",
 			Channels: []string{"mock"},
 		}
-		err := router.RouteNotification(notif)
-		if err != nil {
+		if err := router.RouteNotification(notif); err != nil {
 			t.Fatalf("Failed to route notification %d: %v", i, err)
 		}
 	}
 
-	// 第6个应该失败（队列满）
 	notif := &model.Notification{
 		ID:       "test-6",
 		UserID:   "user1",
 		Content:  "test",
 		Channels: []string{"mock"},
 	}
-	err := router.RouteNotification(notif)
-	if err == nil {
+	if err := router.RouteNotification(notif); err == nil {
 		t.Error("Expected error when queue is full, but got nil")
 	}
 }
@@ -119,12 +118,10 @@ func TestRouterQueueSize(t *testing.T) {
 	mockChannel := &MockChannelRouter{delay: 50 * time.Millisecond}
 	router.RegisterChannel("mock", mockChannel)
 
-	initialSize := router.GetQueueSize()
-	if initialSize != 0 {
+	if initialSize := router.GetQueueSize(); initialSize != 0 {
 		t.Errorf("Expected initial queue size 0, got %d", initialSize)
 	}
 
-	// 添加通知
 	notif := &model.Notification{
 		ID:       "test-1",
 		UserID:   "user1",
@@ -132,19 +129,17 @@ func TestRouterQueueSize(t *testing.T) {
 		Channels: []string{"mock"},
 	}
 
-	router.RouteNotification(notif)
+	if err := router.RouteNotification(notif); err != nil {
+		t.Fatalf("route notification: %v", err)
+	}
 
-	// 队列大小应该增加（或立即处理，都可接受）
-	size := router.GetQueueSize()
-	if size < 0 {
+	if size := router.GetQueueSize(); size < 0 {
 		t.Errorf("Expected queue size >= 0, got %d", size)
 	}
 
-	// 等待处理
 	time.Sleep(100 * time.Millisecond)
 
-	finalSize := router.GetQueueSize()
-	if finalSize < 0 {
+	if finalSize := router.GetQueueSize(); finalSize < 0 {
 		t.Errorf("Expected queue size >= 0 after processing, got %d", finalSize)
 	}
 }
@@ -174,19 +169,17 @@ func TestRouterMultipleChannels(t *testing.T) {
 		Channels: []string{"email", "sms"},
 	}
 
-	err := router.RouteNotification(notification)
-	if err != nil {
+	if err := router.RouteNotification(notification); err != nil {
 		t.Fatalf("Failed to route notification: %v", err)
 	}
 
-	// 等待异步处理
 	time.Sleep(100 * time.Millisecond)
 
-	if emailChannel.sendCount == 0 {
+	if emailChannel.sendCount.Load() == 0 {
 		t.Errorf("Expected email channel to be called")
 	}
 
-	if smsChannel.sendCount == 0 {
+	if smsChannel.sendCount.Load() == 0 {
 		t.Errorf("Expected SMS channel to be called")
 	}
 }
@@ -201,27 +194,71 @@ func TestRouterGracefulShutdown(t *testing.T) {
 	}
 
 	router := NewRouterWithConfig(cfg)
-
 	mockChannel := &MockChannelRouter{delay: 20 * time.Millisecond}
 	router.RegisterChannel("mock", mockChannel)
 
-	// 添加几个通知
 	for i := 0; i < 3; i++ {
 		notif := &model.Notification{
-			ID:       string(rune(i)) + "test",
+			ID:       fmt.Sprintf("test-%d", i),
 			UserID:   "user1",
 			Content:  "test",
 			Channels: []string{"mock"},
 		}
-		router.RouteNotification(notif)
+		if err := router.RouteNotification(notif); err != nil {
+			t.Fatalf("route notification %d: %v", i, err)
+		}
 	}
 
-	// 优雅关闭，等待5秒
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	err := router.GracefulStop(ctx)
-	if err != nil {
-		t.Logf("Graceful shutdown returned error (expected if queue not empty): %v", err)
+	if err := router.GracefulStop(ctx); err != nil {
+		t.Fatalf("Graceful shutdown failed: %v", err)
 	}
+
+	if router.GetQueueSize() != 0 {
+		t.Fatalf("expected queue to be empty, got %d", router.GetQueueSize())
+	}
+	if router.getProcessingCount() != 0 {
+		t.Fatalf("expected no active processing, got %d", router.getProcessingCount())
+	}
+}
+
+func TestRouterRejectsNewNotificationsAfterGracefulStop(t *testing.T) {
+	router := NewRouterWithConfig(&RouterConfig{
+		BufferSize:  10,
+		WorkerCount: 1,
+		MaxRetries:  0,
+		RetryDelay:  10 * time.Millisecond,
+	})
+	router.RegisterChannel("mock", &MockChannelRouter{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	if err := router.GracefulStop(ctx); err != nil {
+		t.Fatalf("graceful stop failed: %v", err)
+	}
+
+	err := router.RouteNotification(&model.Notification{
+		ID:       "after-stop",
+		UserID:   "user1",
+		Content:  "test",
+		Channels: []string{"mock"},
+	})
+	if err == nil {
+		t.Fatal("expected routing to fail after graceful stop")
+	}
+}
+
+func TestRouterStopIsIdempotent(t *testing.T) {
+	router := NewRouterWithConfig(&RouterConfig{
+		BufferSize:  1,
+		WorkerCount: 1,
+		MaxRetries:  0,
+		RetryDelay:  10 * time.Millisecond,
+	})
+
+	router.Stop()
+	router.Stop()
 }

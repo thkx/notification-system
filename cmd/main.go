@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -23,47 +24,113 @@ import (
 	"github.com/thkx/notification-system/pkg/model"
 )
 
+type application struct {
+	config             *config.Config
+	container          *di.Container
+	analytics          *analytics.Analytics
+	router             *router.Router
+	store              storage.NotificationStore
+	distribution       *distribution.Distribution
+	gateway            *gateway.Gateway
+	httpServer         *api.Server
+	orderService       *services.OrderService
+	paymentService     *services.PaymentService
+	demoNotifications  []*model.Notification
+	registeredChannels []string
+}
+
+type ioCloser interface {
+	Close() error
+}
+
 func main() {
-	// 捕获异常，确保系统优雅退出
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Println("System recovered from panic:", r)
 		}
 	}()
 
-	// 加载配置
-	cfg := config.LoadConfig()
+	if err := run(); err != nil {
+		log.Fatalf("notification system exited with error: %v", err)
+	}
+}
 
-	// 初始化metrics配置
+func run() error {
+	cfg := config.LoadConfig()
+	app, err := buildApplication(cfg)
+	if err != nil {
+		return err
+	}
+
+	serverErrCh := make(chan error, 1)
+	go func() {
+		if err := app.httpServer.Start(); err != nil {
+			serverErrCh <- err
+		}
+		close(serverErrCh)
+	}()
+
+	if shouldRunStartupDemo() {
+		runStartupDemo(app)
+	}
+
+	printStartupSummary(app)
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case sig := <-sigChan:
+		fmt.Printf("\nShutdown signal received (%s), performing graceful shutdown...\n", sig)
+	case err := <-serverErrCh:
+		if err != nil {
+			return fmt.Errorf("http server failed: %w", err)
+		}
+		return fmt.Errorf("http server stopped unexpectedly")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := app.httpServer.Shutdown(ctx); err != nil {
+		log.Printf("HTTP server graceful shutdown error: %v", err)
+	}
+	if err := app.router.GracefulStop(ctx); err != nil {
+		log.Printf("Router graceful stop error: %v", err)
+	}
+	if closer, ok := app.store.(ioCloser); ok {
+		if err := closer.Close(); err != nil {
+			log.Printf("Store close error: %v", err)
+		}
+	}
+
+	fmt.Println("Shutdown complete, exiting.")
+	return nil
+}
+
+func buildApplication(cfg *config.Config) (*application, error) {
 	metrics.InitMetricsWithConfig(
 		cfg.Metrics.MaxFailureRate,
 		cfg.Metrics.MaxQueueUtilization,
 		cfg.Metrics.MaxProcessingTime,
 	)
 
-	// 初始化依赖注入容器
 	container := di.NewContainer()
-
-	// 注入配置
 	container.Register("config", cfg)
 
-	// 初始化组件
 	analyticsService := analytics.NewAnalytics()
 	container.Register("analytics", analyticsService)
 
-	// 初始化渠道
 	emailChannel := channels.NewEmailChannel()
 	inAppChannel := channels.NewInAppChannel()
 	smsChannel := channels.NewSMSChannel()
 	socialMediaChannel := channels.NewSocialMediaChannel()
 
-	// 注入渠道
 	container.Register("emailChannel", emailChannel)
 	container.Register("inAppChannel", inAppChannel)
 	container.Register("smsChannel", smsChannel)
 	container.Register("socialMediaChannel", socialMediaChannel)
 
-	// 初始化路由器，使用配置中的参数
 	routerCfg := &router.RouterConfig{
 		BufferSize:  cfg.Router.BufferSize,
 		WorkerCount: cfg.Router.WorkerCount,
@@ -71,77 +138,123 @@ func main() {
 		RetryDelay:  time.Duration(cfg.Router.RetryDelayMs) * time.Millisecond,
 	}
 	notificationRouter := router.NewRouterWithConfig(routerCfg)
+
+	registeredChannels := make([]string, 0, 4)
 	if cfg.Channels.Email.Enabled {
 		notificationRouter.RegisterChannel("email", emailChannel)
+		registeredChannels = append(registeredChannels, "email")
 	}
 	if cfg.Channels.InApp.Enabled {
 		notificationRouter.RegisterChannel("inapp", inAppChannel)
+		registeredChannels = append(registeredChannels, "inapp")
 	}
 	if cfg.Channels.SMS.Enabled {
 		notificationRouter.RegisterChannel("sms", smsChannel)
+		registeredChannels = append(registeredChannels, "sms")
 	}
 	if cfg.Channels.SocialMedia.Enabled {
 		notificationRouter.RegisterChannel("social", socialMediaChannel)
+		registeredChannels = append(registeredChannels, "social")
 	}
 	container.Register("router", notificationRouter)
 
-	// 初始化持久化存储（可选择 memory/postgres）
-	var store storage.NotificationStore
-	if cfg.Store.Type == "postgres" {
-		pgStore, err := storage.NewPostgresStore(cfg.Store.DSN)
-		if err != nil {
-			fmt.Printf("Failed to initialize PostgreSQL store: %v, falling back to memory store\n", err)
-			store = storage.NewMemoryStore()
-		} else {
-			store = pgStore
-		}
-	} else {
-		store = storage.NewMemoryStore()
+	store, err := newStore(cfg)
+	if err != nil {
+		return nil, err
 	}
 	container.Register("store", store)
 
-	// 初始化分发器
-	distribution := distribution.NewDistributionWithTTL(notificationRouter, cfg.Distribution.DeduplicationTTL)
-	container.Register("distribution", distribution)
+	dist := distribution.NewDistributionWithTTL(notificationRouter, cfg.Distribution.DeduplicationTTL)
+	container.Register("distribution", dist)
 
-	// 初始化网关
-	notificationGateway := gateway.NewGateway(distribution, store)
+	notificationGateway := gateway.NewGateway(dist, store)
 	container.Register("gateway", notificationGateway)
 
-	// 初始化HTTP服务器
 	httpServer := api.NewServer(notificationGateway, cfg.Server.Port)
 	container.Register("httpServer", httpServer)
 
-	// 启动HTTP服务器
-	go func() {
-		if err := httpServer.Start(); err != nil {
-			log.Fatalf("HTTP server failed to start: %v", err)
-		}
-	}()
-
-	// 初始化业务服务
 	orderService := services.NewOrderService(notificationGateway)
 	paymentService := services.NewPaymentService(notificationGateway)
 	container.Register("orderService", orderService)
 	container.Register("paymentService", paymentService)
 
-	// 测试通知发送
-	fmt.Println("Testing notification system...")
+	return &application{
+		config:             cfg,
+		container:          container,
+		analytics:          analyticsService,
+		router:             notificationRouter,
+		store:              store,
+		distribution:       dist,
+		gateway:            notificationGateway,
+		httpServer:         httpServer,
+		orderService:       orderService,
+		paymentService:     paymentService,
+		demoNotifications:  defaultDemoNotifications(),
+		registeredChannels: registeredChannels,
+	}, nil
+}
 
-	// 测试订单服务
-	err := orderService.ProcessOrder("123", "user123")
+func newStore(cfg *config.Config) (storage.NotificationStore, error) {
+	if cfg.Store.Type != "postgres" {
+		return storage.NewMemoryStore(), nil
+	}
+
+	pgStore, err := storage.NewPostgresStore(cfg.Store.DSN)
 	if err != nil {
+		fmt.Printf("Failed to initialize PostgreSQL store: %v, falling back to memory store\n", err)
+		return storage.NewMemoryStore(), nil
+	}
+
+	return pgStore, nil
+}
+
+func shouldRunStartupDemo() bool {
+	raw := strings.TrimSpace(strings.ToLower(os.Getenv("NOTIFICATION_RUN_DEMO")))
+	return raw == "1" || raw == "true" || raw == "yes"
+}
+
+func runStartupDemo(app *application) {
+	fmt.Println("Running startup demo...")
+
+	if err := app.orderService.ProcessOrder("123", "user123"); err != nil {
 		fmt.Println("Error sending order notification:", err)
 	}
 
-	// 测试支付服务
-	err = paymentService.ProcessPayment("456", "user123")
-	if err != nil {
+	if err := app.paymentService.ProcessPayment("456", "user123"); err != nil {
 		fmt.Println("Error sending payment notification:", err)
 	}
 
-	// 测试批量通知
-	notifications := []*model.Notification{
+	result, err := app.gateway.SendBatchNotifications(app.demoNotifications)
+	if err != nil {
+		fmt.Printf("Error sending batch notifications: %v\n", err)
+	}
+	if result != nil && result.Failed > 0 {
+		fmt.Printf("Batch result: Total=%d, Successful=%d, Failed=%d\n",
+			result.Total, result.Successful, result.Failed)
+	}
+
+	fmt.Println("Startup demo completed!")
+}
+
+func printStartupSummary(app *application) {
+	fmt.Println("Notification system started successfully!")
+	fmt.Printf("Environment: %s\n", app.config.Environment)
+	fmt.Printf("HTTP server running on port %d\n", app.config.Server.Port)
+	fmt.Printf("Registered channels: %s\n", strings.Join(app.registeredChannels, ", "))
+	fmt.Printf("Storage backend: %s\n", app.config.Store.Type)
+	fmt.Println("API endpoints:")
+	fmt.Println("  GET  /health - Health check")
+	fmt.Println("  POST /api/notifications - Send single notification")
+	fmt.Println("  GET  /api/notifications - List notifications")
+	fmt.Println("  GET  /api/notifications/{id} - Query notification by ID")
+	fmt.Println("  POST /api/notifications/batch - Send batch notifications")
+	fmt.Println("  GET  /ws - WebSocket connection for real-time notifications")
+	fmt.Println("\nSet NOTIFICATION_RUN_DEMO=true to run startup demo notifications.")
+	fmt.Println("Press Ctrl+C to shutdown gracefully...")
+}
+
+func defaultDemoNotifications() []*model.Notification {
+	return []*model.Notification{
 		{
 			ID:       "batch-1",
 			UserID:   "user456",
@@ -159,58 +272,4 @@ func main() {
 			Priority: 1,
 		},
 	}
-
-	result, err := notificationGateway.SendBatchNotifications(notifications)
-	if err != nil {
-		fmt.Printf("Error sending batch notifications: %v\n", err)
-	}
-	if result != nil && result.Failed > 0 {
-		fmt.Printf("Batch result: Total=%d, Successful=%d, Failed=%d\n",
-			result.Total, result.Successful, result.Failed)
-	}
-
-	fmt.Println("Notification system test completed!")
-	fmt.Println("Queue size:", notificationRouter.GetQueueSize())
-	fmt.Println("Event count:", analyticsService.GetEventCount())
-
-	// 输出监控指标
-	metrics := metrics.GetMetrics()
-	fmt.Println("\nMetrics:")
-	fmt.Println("Total notifications:", metrics.GetTotal())
-	fmt.Println("Successful notifications:", metrics.GetSuccessful())
-	fmt.Println("Failed notifications:", metrics.GetFailed())
-	fmt.Println("Channel metrics:")
-	for channel, metric := range metrics.GetChannelMetrics() {
-		fmt.Printf("  %s: Total=%d, Successful=%d, Failed=%d\n",
-			channel, metric.Total, metric.Successful, metric.Failed)
-	}
-
-	// 等待系统运行，保持HTTP服务器活跃
-	fmt.Println("Notification system started successfully!")
-	fmt.Printf("HTTP server running on port %d\n", cfg.Server.Port)
-	fmt.Println("API endpoints:")
-	fmt.Println("  GET  /health - Health check")
-	fmt.Println("  POST /api/notifications - Send single notification")
-	fmt.Println("  POST /api/notifications/batch - Send batch notifications")
-	fmt.Println("  GET  /ws - WebSocket connection for real-time notifications")
-	fmt.Println("\nPress Ctrl+C to shutdown gracefully...")
-
-	// 设置信号处理，实现优雅关闭
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	// 等待中断信号
-	<-sigChan
-
-	fmt.Println("\nShutdown signal received, performing graceful shutdown...")
-
-	// 等待队列处理完成（最多30秒）
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if err := notificationRouter.GracefulStop(ctx); err != nil {
-		log.Printf("Router graceful stop error: %v", err)
-	}
-
-	fmt.Println("Shutdown complete, exiting.")
 }

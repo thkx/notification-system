@@ -4,73 +4,78 @@ import (
 	"testing"
 	"time"
 
-	"github.com/thkx/notification-system/internal/channels"
-	"github.com/thkx/notification-system/internal/distribution"
-	"github.com/thkx/notification-system/internal/gateway"
-	"github.com/thkx/notification-system/internal/router"
-	"github.com/thkx/notification-system/internal/services"
-	"github.com/thkx/notification-system/internal/storage"
-	"github.com/thkx/notification-system/pkg/model"
+	"github.com/thkx/notification-system/config"
 )
 
-func TestNotificationSystem(t *testing.T) {
-	// 初始化组件
-	emailChannel := channels.NewEmailChannel()
-	inAppChannel := channels.NewInAppChannel()
-	smsChannel := channels.NewSMSChannel()
-	socialMediaChannel := channels.NewSocialMediaChannel()
-
-	router := router.NewRouter()
-	router.RegisterChannel("email", emailChannel)
-	router.RegisterChannel("inapp", inAppChannel)
-	router.RegisterChannel("sms", smsChannel)
-	router.RegisterChannel("social", socialMediaChannel)
-
-	distribution := distribution.NewDistribution(router)
-	notificationGateway := gateway.NewGateway(distribution, storage.NewMemoryStore())
-
-	orderService := services.NewOrderService(notificationGateway)
-	paymentService := services.NewPaymentService(notificationGateway)
-
-	// 测试订单服务
-	err := orderService.ProcessOrder("test-123", "test-user")
-	if err != nil {
-		t.Errorf("Order service failed: %v", err)
-	}
-
-	// 测试支付服务
-	err = paymentService.ProcessPayment("test-456", "test-user")
-	if err != nil {
-		t.Errorf("Payment service failed: %v", err)
-	}
-
-	// 测试批量通知
-	notifications := []*model.Notification{
-		{
-			ID:       "batch-test-1",
-			UserID:   "test-user-2",
-			Type:     "promotion",
-			Content:  "Test promotion",
-			Channels: []string{"email", "social"},
-			Priority: 1,
+func TestBuildApplication(t *testing.T) {
+	cfg := &config.Config{
+		Server: config.ServerConfig{Port: 8080},
+		Router: config.RouterConfig{
+			BufferSize:   10,
+			WorkerCount:  1,
+			MaxRetries:   1,
+			RetryDelayMs: 10,
 		},
+		Channels: config.ChannelsConfig{
+			Email:       config.ChannelConfig{Enabled: true},
+			SMS:         config.ChannelConfig{Enabled: true},
+			InApp:       config.ChannelConfig{Enabled: true},
+			SocialMedia: config.ChannelConfig{Enabled: true},
+		},
+		Metrics: config.MetricsConfig{
+			MaxFailureRate:      0.2,
+			MaxQueueUtilization: 0.8,
+			MaxProcessingTime:   5000,
+		},
+		Distribution: config.DistributionConfig{DeduplicationTTL: 60},
+		Store:        config.StoreConfig{Type: "memory"},
+		Environment:  "test",
 	}
 
-	result, err := notificationGateway.SendBatchNotifications(notifications)
+	app, err := buildApplication(cfg)
 	if err != nil {
-		t.Errorf("Batch notification failed: %v", err)
+		t.Fatalf("build application: %v", err)
 	}
-	if result != nil && result.Failed > 0 {
-		t.Logf("Batch result: Total=%d, Successful=%d, Failed=%d",
-			result.Total, result.Successful, result.Failed)
+	defer app.router.Stop()
+
+	if app.gateway == nil || app.httpServer == nil {
+		t.Fatal("expected application services to be initialized")
 	}
 
-	// 等待一段时间，确保通知被处理
+	if len(app.registeredChannels) != 4 {
+		t.Fatalf("expected 4 registered channels, got %d", len(app.registeredChannels))
+	}
+
+	if err := app.orderService.ProcessOrder("test-123", "test-user"); err != nil {
+		t.Fatalf("order service failed: %v", err)
+	}
+
+	if err := app.paymentService.ProcessPayment("test-456", "test-user"); err != nil {
+		t.Fatalf("payment service failed: %v", err)
+	}
+
+	result, err := app.gateway.SendBatchNotifications(defaultDemoNotifications())
+	if err != nil {
+		t.Fatalf("batch notifications failed: %v", err)
+	}
+	if result == nil || result.Total != 2 {
+		t.Fatalf("expected batch result total 2, got %#v", result)
+	}
+
 	time.Sleep(100 * time.Millisecond)
+	if queueSize := app.router.GetQueueSize(); queueSize < 0 {
+		t.Fatalf("expected queue size >= 0, got %d", queueSize)
+	}
+}
 
-	// 验证队列大小（使用通道后，队列大小会快速变为0）
-	queueSize := router.GetQueueSize()
-	if queueSize < 0 {
-		t.Errorf("Expected queue size >= 0, got %d", queueSize)
+func TestShouldRunStartupDemo(t *testing.T) {
+	t.Setenv("NOTIFICATION_RUN_DEMO", "true")
+	if !shouldRunStartupDemo() {
+		t.Fatal("expected startup demo to be enabled")
+	}
+
+	t.Setenv("NOTIFICATION_RUN_DEMO", "false")
+	if shouldRunStartupDemo() {
+		t.Fatal("expected startup demo to be disabled")
 	}
 }

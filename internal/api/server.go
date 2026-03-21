@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -20,9 +21,10 @@ type Server struct {
 	gateway      *gateway.Gateway
 	router       *mux.Router
 	port         int
+	httpServer   *http.Server
 	upgrader     websocket.Upgrader
 	clients      map[*websocket.Conn]bool
-	clientsMutex sync.Mutex
+	clientsMutex sync.RWMutex
 }
 
 // NewServer 创建一个新的HTTP服务器实例
@@ -40,6 +42,10 @@ func NewServer(gateway *gateway.Gateway, port int) *Server {
 		clients: make(map[*websocket.Conn]bool),
 	}
 	server.setupRoutes()
+	server.httpServer = &http.Server{
+		Addr:    fmt.Sprintf(":%d", port),
+		Handler: server.router,
+	}
 	return server
 }
 
@@ -63,16 +69,22 @@ func (s *Server) setupRoutes() {
 
 // Start 启动HTTP服务器
 func (s *Server) Start() error {
-	serverAddr := fmt.Sprintf(":%d", s.port)
-	log.Printf("HTTP server starting on %s", serverAddr)
-	return http.ListenAndServe(serverAddr, s.router)
+	log.Printf("HTTP server starting on %s", s.httpServer.Addr)
+	err := s.httpServer.ListenAndServe()
+	if err != nil && err != http.ErrServerClosed {
+		return err
+	}
+	return nil
+}
+
+// Shutdown 优雅关闭HTTP服务器
+func (s *Server) Shutdown(ctx context.Context) error {
+	return s.httpServer.Shutdown(ctx)
 }
 
 // healthCheck 健康检查接口
 func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{
+	writeJSON(w, http.StatusOK, map[string]string{
 		"status":  "ok",
 		"service": "notification-system",
 	})
@@ -82,42 +94,32 @@ func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
 func (s *Server) sendNotification(w http.ResponseWriter, r *http.Request) {
 	var notification model.Notification
 	if err := json.NewDecoder(r.Body).Decode(&notification); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
 		return
 	}
 
 	if err := s.gateway.SendNotification(&notification); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 
 	// 广播通知给所有WebSocket客户端
 	go s.Broadcast(&notification)
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "success"})
 }
 
 // sendBatchNotifications 批量发送通知的API接口
 func (s *Server) sendBatchNotifications(w http.ResponseWriter, r *http.Request) {
 	var notifications []*model.Notification
 	if err := json.NewDecoder(r.Body).Decode(&notifications); err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid request body"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
 		return
 	}
 
 	result, err := s.gateway.SendBatchNotifications(notifications)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]interface{}{
+		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
 			"error":  err.Error(),
 			"result": result,
 		})
@@ -126,24 +128,22 @@ func (s *Server) sendBatchNotifications(w http.ResponseWriter, r *http.Request) 
 
 	// 广播所有成功的通知给WebSocket客户端（异步处理）
 	go func() {
+		failedIDs := make(map[string]struct{}, len(result.FailedIDs))
+		for _, failedID := range result.FailedIDs {
+			failedIDs[failedID] = struct{}{}
+		}
+
 		for _, notification := range notifications {
-			// 只广播那些处理成功的通知（通过检查是否在失败ID列表中）
-			found := false
-			for _, failedID := range result.FailedIDs {
-				if notification.ID == failedID {
-					found = true
-					break
-				}
+			if notification == nil {
+				continue
 			}
-			if !found {
+			if _, failed := failedIDs[notification.ID]; !failed {
 				s.Broadcast(notification)
 			}
 		}
 	}()
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status": "success",
 		"result": result,
 	})
@@ -154,30 +154,22 @@ func (s *Server) getNotificationByID(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id := vars["id"]
 	if id == "" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		json.NewEncoder(w).Encode(map[string]string{"error": "id is required"})
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "id is required"})
 		return
 	}
 
 	notification, err := s.gateway.GetNotificationByID(id)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 
 	if notification == nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusNotFound)
-		json.NewEncoder(w).Encode(map[string]string{"error": "notification not found"})
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "notification not found"})
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(notification)
+	writeJSON(w, http.StatusOK, notification)
 }
 
 // listNotifications 查询通知列表
@@ -190,15 +182,11 @@ func (s *Server) listNotifications(w http.ResponseWriter, r *http.Request) {
 
 	notifications, err := s.gateway.ListNotifications(filter)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(notifications)
+	writeJSON(w, http.StatusOK, notifications)
 }
 
 // handleWebSocket 处理WebSocket连接
@@ -213,9 +201,10 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// 将新客户端添加到客户端映射中
 	s.clientsMutex.Lock()
 	s.clients[conn] = true
+	clientCount := len(s.clients)
 	s.clientsMutex.Unlock()
 
-	log.Printf("New WebSocket client connected. Total clients: %d", len(s.clients))
+	log.Printf("New WebSocket client connected. Total clients: %d", clientCount)
 
 	// 发送连接成功消息
 	welcomeMsg := map[string]string{
@@ -233,12 +222,8 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 // handleClient 处理单个WebSocket客户端连接
 func (s *Server) handleClient(conn *websocket.Conn) {
 	defer func() {
-		// 从客户端映射中移除并关闭连接
-		s.clientsMutex.Lock()
-		delete(s.clients, conn)
-		s.clientsMutex.Unlock()
-		conn.Close()
-		log.Printf("WebSocket client disconnected. Total clients: %d", len(s.clients))
+		s.removeClient(conn)
+		log.Printf("WebSocket client disconnected. Total clients: %d", s.clientCount())
 	}()
 
 	// 持续读取客户端消息
@@ -258,21 +243,59 @@ func (s *Server) handleClient(conn *websocket.Conn) {
 
 // Broadcast 向所有WebSocket客户端广播通知
 func (s *Server) Broadcast(notification *model.Notification) {
+	if notification == nil {
+		return
+	}
+
 	message := map[string]interface{}{
 		"type":         "notification",
 		"notification": notification,
 	}
 
-	s.clientsMutex.Lock()
-	defer s.clientsMutex.Unlock()
+	clients := s.snapshotClients()
 
-	for client := range s.clients {
+	for _, client := range clients {
 		if err := client.WriteJSON(message); err != nil {
 			log.Printf("Failed to broadcast to client: %v", err)
-			client.Close()
-			delete(s.clients, client)
+			s.removeClient(client)
 		}
 	}
 
-	log.Printf("Broadcasted notification to %d clients", len(s.clients))
+	log.Printf("Broadcasted notification to %d clients", len(clients))
+}
+
+func (s *Server) snapshotClients() []*websocket.Conn {
+	s.clientsMutex.RLock()
+	defer s.clientsMutex.RUnlock()
+
+	clients := make([]*websocket.Conn, 0, len(s.clients))
+	for client := range s.clients {
+		clients = append(clients, client)
+	}
+
+	return clients
+}
+
+func (s *Server) removeClient(conn *websocket.Conn) {
+	s.clientsMutex.Lock()
+	defer s.clientsMutex.Unlock()
+
+	if _, exists := s.clients[conn]; exists {
+		delete(s.clients, conn)
+		conn.Close()
+	}
+}
+
+func (s *Server) clientCount() int {
+	s.clientsMutex.RLock()
+	defer s.clientsMutex.RUnlock()
+	return len(s.clients)
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		log.Printf("Failed to encode response: %v", err)
+	}
 }

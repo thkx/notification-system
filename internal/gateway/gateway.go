@@ -11,6 +11,14 @@ import (
 	"github.com/thkx/notification-system/pkg/retry"
 )
 
+const (
+	statusPending    = "pending"
+	statusProcessing = "processing"
+	statusFailed     = "failed"
+	statusDuplicate  = "duplicate"
+	statusSent       = "sent"
+)
+
 // BatchResult 批量发送结果
 type BatchResult struct {
 	Total      int      `json:"total"`      // 总通知数
@@ -41,9 +49,7 @@ func NewGateway(distribution *distribution.Distribution, store storage.Notificat
 // @param notification 待发送的通知
 // @return 发送过程中的错误
 func (g *Gateway) SendNotification(notification *model.Notification) error {
-	// 首先验证通知不为nil
-	if notification == nil {
-		err := errors.ValidationError("Invalid notification", "Notification cannot be nil", nil)
+	if err := validateNotification(notification); err != nil {
 		logger.Error("Failed to send notification: %v", err)
 		return err
 	}
@@ -51,30 +57,14 @@ func (g *Gateway) SendNotification(notification *model.Notification) error {
 	logger.Info("Sending single notification: ID=%s, UserID=%s, Type=%s",
 		notification.ID, notification.UserID, notification.Type)
 
-	// 验证用户ID
-	if notification.UserID == "" {
-		err := errors.ValidationError("Invalid notification", "UserID cannot be empty", nil)
-		logger.Error("Failed to send notification: %v", err)
-		return err
-	}
-
-	// 验证渠道
-	if len(notification.Channels) == 0 {
-		err := errors.ValidationError("Invalid notification", "At least one channel must be specified", nil)
-		logger.Error("Failed to send notification: %v", err)
-		return err
-	}
-
-	// 直接使用model.Notification，无需转换
-
 	if g.store != nil {
 		if notification.Status == "" {
-			notification.Status = "pending"
+			notification.Status = statusPending
 		}
 		if err := g.store.Save(notification); err != nil {
 			logger.Error("Failed to persist notification: ID=%s, Error=%v", notification.ID, err)
 		}
-		if err := g.store.UpdateStatus(notification.ID, "processing"); err != nil {
+		if err := g.store.UpdateStatus(notification.ID, statusProcessing); err != nil {
 			logger.Warn("Failed to update notification status to processing: ID=%s, Error=%v", notification.ID, err)
 		}
 	}
@@ -85,14 +75,14 @@ func (g *Gateway) SendNotification(notification *model.Notification) error {
 	}, retry.DefaultRetryConfig())
 	if err != nil {
 		if g.store != nil {
-			if updateErr := g.store.UpdateStatus(notification.ID, "failed"); updateErr != nil {
+			if updateErr := g.store.UpdateStatus(notification.ID, statusFailed); updateErr != nil {
 				logger.Warn("Failed to update notification status to failed: ID=%s, Error=%v", notification.ID, updateErr)
 			}
 		}
 
 		if appErr, ok := err.(*errors.AppError); ok && appErr.Type == errors.ErrorTypeDistribution && appErr.Message == "Duplicate notification" {
 			if g.store != nil {
-				if updateErr := g.store.UpdateStatus(notification.ID, "duplicate"); updateErr != nil {
+				if updateErr := g.store.UpdateStatus(notification.ID, statusDuplicate); updateErr != nil {
 					logger.Warn("Failed to update notification status to duplicate: ID=%s, Error=%v", notification.ID, updateErr)
 				}
 			}
@@ -106,7 +96,7 @@ func (g *Gateway) SendNotification(notification *model.Notification) error {
 	}
 
 	if g.store != nil {
-		if err := g.store.UpdateStatus(notification.ID, "sent"); err != nil {
+		if err := g.store.UpdateStatus(notification.ID, statusSent); err != nil {
 			logger.Warn("Failed to update notification status to sent: ID=%s, Error=%v", notification.ID, err)
 		}
 	}
@@ -162,7 +152,6 @@ func (g *Gateway) SendBatchNotifications(notifications []*model.Notification) (*
 
 		// 处理当前批次的通知
 		for _, notification := range batch {
-			// 检查通知是否为空
 			if notification == nil {
 				result.Failed++
 				logger.Error("Failed to send batch notification: notification is nil")
@@ -172,23 +161,9 @@ func (g *Gateway) SendBatchNotifications(notifications []*model.Notification) (*
 				continue
 			}
 
-			// 验证用户ID
-			if notification.UserID == "" {
+			if err := validateNotification(notification); err != nil {
 				result.Failed++
 				result.FailedIDs = append(result.FailedIDs, notification.ID)
-				err := errors.ValidationError("Invalid notification", "UserID cannot be empty", nil)
-				logger.Error("Failed to send batch notification: %v", err)
-				if result.FirstError == nil {
-					result.FirstError = err
-				}
-				continue
-			}
-
-			// 验证渠道
-			if len(notification.Channels) == 0 {
-				result.Failed++
-				result.FailedIDs = append(result.FailedIDs, notification.ID)
-				err := errors.ValidationError("Invalid notification", "At least one channel must be specified", nil)
 				logger.Error("Failed to send batch notification: %v", err)
 				if result.FirstError == nil {
 					result.FirstError = err
@@ -222,4 +197,20 @@ func (g *Gateway) SendBatchNotifications(notifications []*model.Notification) (*
 	}
 
 	return result, result.FirstError
+}
+
+func validateNotification(notification *model.Notification) error {
+	if notification == nil {
+		return errors.ValidationError("Invalid notification", "Notification cannot be nil", nil)
+	}
+
+	if notification.UserID == "" {
+		return errors.ValidationError("Invalid notification", "UserID cannot be empty", nil)
+	}
+
+	if len(notification.Channels) == 0 {
+		return errors.ValidationError("Invalid notification", "At least one channel must be specified", nil)
+	}
+
+	return nil
 }

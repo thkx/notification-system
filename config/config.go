@@ -180,6 +180,7 @@ var (
 	globalConfig *Config
 	configMutex  sync.RWMutex
 	configPath   string
+	watchOnce    sync.Once
 )
 
 // LoadConfig 加载系统配置
@@ -221,8 +222,9 @@ func LoadConfigFromFile(filePath string) *Config {
 				config = *getDefaultConfig()
 			}
 			globalConfig = &config
-			// 启动配置热更新监控
-			go monitorConfigChanges(filePath)
+			watchOnce.Do(func() {
+				go monitorConfigChanges(filePath)
+			})
 			return globalConfig
 		}
 	}
@@ -237,12 +239,13 @@ func LoadConfigFromFile(filePath string) *Config {
 // @return 全局配置实例
 func GetConfig() *Config {
 	configMutex.RLock()
-	defer configMutex.RUnlock()
+	cfg := globalConfig
+	configMutex.RUnlock()
 
-	if globalConfig == nil {
+	if cfg == nil {
 		return LoadConfig()
 	}
-	return globalConfig
+	return cfg
 }
 
 // monitorConfigChanges 监控配置文件变化

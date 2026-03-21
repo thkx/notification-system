@@ -1,7 +1,10 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 // TestServerConfigValidation 测试服务器配置验证
@@ -167,5 +170,60 @@ func TestConfigValidation(t *testing.T) {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestGetConfigLoadsWithoutDeadlock(t *testing.T) {
+	originalConfig := globalConfig
+	globalConfig = nil
+	t.Cleanup(func() {
+		globalConfig = originalConfig
+	})
+
+	dir := t.TempDir()
+	configFile := filepath.Join(dir, "config.test.json")
+	content := `{
+		"server": {"port": 8080},
+		"router": {"bufferSize": 10, "workerCount": 1, "maxRetries": 1, "retryDelayMs": 10},
+		"channels": {
+			"email": {"enabled": true},
+			"sms": {"enabled": true},
+			"inapp": {"enabled": true},
+			"social_media": {"enabled": true}
+		},
+		"metrics": {"maxFailureRate": 0.2, "maxQueueUtilization": 0.8, "maxProcessingTime": 5000},
+		"distribution": {"deduplicationTTL": 60},
+		"store": {"type": "memory"},
+		"environment": "test"
+	}`
+	if err := os.WriteFile(configFile, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file: %v", err)
+	}
+
+	originalWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chdir(originalWd)
+	})
+
+	t.Setenv("NOTIFICATION_ENV", "test")
+
+	done := make(chan *Config, 1)
+	go func() {
+		done <- GetConfig()
+	}()
+
+	select {
+	case cfg := <-done:
+		if cfg == nil {
+			t.Fatal("expected config to be loaded")
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("GetConfig/LoadConfig path appears blocked")
 	}
 }

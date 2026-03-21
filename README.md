@@ -49,7 +49,7 @@ notification-system/
 
 ### 环境要求
 
-- Go 1.18+
+- Go 1.25+
 
 ### 安装和运行
 
@@ -85,6 +85,36 @@ cp config.json config.development.json
 ```bash
 go run cmd/main.go
 ```
+
+默认启动不会自动发送演示通知。如果需要在启动时跑一组演示消息，可设置：
+
+```bash
+NOTIFICATION_RUN_DEMO=true go run ./cmd
+```
+
+### 常用开发命令
+
+项目已提供 `Makefile`，本地开发可以直接使用：
+
+```bash
+make fmt        # 格式化代码
+make test       # 运行全部测试
+make test-short # 运行短测试
+make bench      # 运行 benchmark
+make run        # 启动服务
+```
+
+### CI
+
+项目已包含 GitHub Actions 工作流：
+
+- 提交到 `main` / `master`
+- 发起 Pull Request
+
+都会自动执行：
+
+- `gofmt` 检查
+- `go test ./...`
 
 ### 配置说明
 
