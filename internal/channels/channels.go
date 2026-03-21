@@ -3,13 +3,19 @@ package channels
 import (
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 
+	"github.com/sendgrid/rest"
+	"github.com/sendgrid/sendgrid-go"
+	"github.com/sendgrid/sendgrid-go/helpers/mail"
 	"github.com/thkx/notification-system/pkg/errors"
 	"github.com/thkx/notification-system/pkg/logger"
 	"github.com/thkx/notification-system/pkg/metrics"
 	"github.com/thkx/notification-system/pkg/model"
 	"github.com/thkx/notification-system/pkg/retry"
+	twilio "github.com/twilio/twilio-go"
+	openapi "github.com/twilio/twilio-go/rest/api/v2010"
 )
 
 // Channel 通知渠道接口，定义了发送通知的方法
@@ -31,6 +37,18 @@ type ChannelFactory func() Channel
 var (
 	channelRegistry = make(map[string]ChannelFactory)
 	registryMutex   sync.RWMutex
+
+	sendGridSend = func(apiKey string, message *mail.SGMailV3) (*rest.Response, error) {
+		return sendgrid.NewSendClient(apiKey).Send(message)
+	}
+	twilioCreateMessage = func(accountSID string, authToken string, params *openapi.CreateMessageParams) error {
+		client := twilio.NewRestClientWithParams(twilio.ClientParams{
+			Username: accountSID,
+			Password: authToken,
+		})
+		_, err := client.Api.CreateMessage(params)
+		return err
+	}
 )
 
 // EmailChannel 邮件通知渠道
@@ -47,11 +65,10 @@ func NewEmailChannel() *EmailChannel {
 // @return 发送过程中的错误
 func (c *EmailChannel) Send(notification *model.Notification) error {
 	metrics := metrics.GetMetrics()
-	metrics.IncrementTotal()
 	metrics.IncrementChannelTotal("email")
 
 	var err error
-	provider := os.Getenv("EMAIL_PROVIDER")
+	provider := normalizedProvider(os.Getenv("EMAIL_PROVIDER"))
 	if provider == "sendgrid" {
 		err = sendGridSendEmail(notification)
 	} else {
@@ -63,12 +80,10 @@ func (c *EmailChannel) Send(notification *model.Notification) error {
 	}
 
 	if err != nil {
-		metrics.IncrementFailed()
 		metrics.IncrementChannelFailed("email")
 		return err
 	}
 
-	metrics.IncrementSuccessful()
 	metrics.IncrementChannelSuccessful("email")
 	return nil
 }
@@ -79,26 +94,67 @@ func (c *EmailChannel) Name() string {
 }
 
 func sendGridSendEmail(notification *model.Notification) error {
-	// 这里可以接入实际 SendGrid SDK
-	apiKey := os.Getenv("SENDGRID_API_KEY")
+	apiKey := strings.TrimSpace(os.Getenv("SENDGRID_API_KEY"))
 	if apiKey == "" {
-		logger.Warn("SENDGRID_API_KEY not set; fallback to mock send")
-		return nil
+		return fmt.Errorf("SENDGRID_API_KEY is required when EMAIL_PROVIDER=sendgrid")
 	}
-	logger.Info("SendGrid sending email to user %s with content: %s", notification.UserID, notification.Content)
-	// TODO: 一旦添加 SendGrid 依赖，调用其 API
+
+	fromEmail := strings.TrimSpace(os.Getenv("SENDGRID_FROM_EMAIL"))
+	if fromEmail == "" {
+		return fmt.Errorf("SENDGRID_FROM_EMAIL is required when EMAIL_PROVIDER=sendgrid")
+	}
+	fromName := strings.TrimSpace(os.Getenv("SENDGRID_FROM_NAME"))
+	toEmail := strings.TrimSpace(notification.UserID)
+	if toEmail == "" {
+		return fmt.Errorf("notification UserID must be a recipient email when EMAIL_PROVIDER=sendgrid")
+	}
+
+	message := mail.NewSingleEmail(
+		mail.NewEmail(fromName, fromEmail),
+		buildEmailSubject(notification),
+		mail.NewEmail("", toEmail),
+		notification.Content,
+		notification.Content,
+	)
+
+	response, err := sendGridSend(apiKey, message)
+	if err != nil {
+		return fmt.Errorf("sendgrid send failed: %w", err)
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return fmt.Errorf("sendgrid send failed: status=%d body=%s", response.StatusCode, strings.TrimSpace(response.Body))
+	}
+
+	logger.Info("SendGrid sent email to %s with status %d", toEmail, response.StatusCode)
 	return nil
 }
 
 func twilioSendSMS(notification *model.Notification) error {
-	accountSid := os.Getenv("TWILIO_ACCOUNT_SID")
-	authToken := os.Getenv("TWILIO_AUTH_TOKEN")
+	accountSid := strings.TrimSpace(os.Getenv("TWILIO_ACCOUNT_SID"))
+	authToken := strings.TrimSpace(os.Getenv("TWILIO_AUTH_TOKEN"))
 	if accountSid == "" || authToken == "" {
-		logger.Warn("TWILIO credentials missing; fallback to mock send")
-		return nil
+		return fmt.Errorf("TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN are required when SMS_PROVIDER=twilio")
 	}
-	logger.Info("Twilio sending SMS to user %s with content: %s", notification.UserID, notification.Content)
-	// TODO: 一旦添加 Twilio 依赖，调用其 API
+
+	fromNumber := strings.TrimSpace(os.Getenv("TWILIO_FROM_NUMBER"))
+	if fromNumber == "" {
+		return fmt.Errorf("TWILIO_FROM_NUMBER is required when SMS_PROVIDER=twilio")
+	}
+	toNumber := strings.TrimSpace(notification.UserID)
+	if toNumber == "" {
+		return fmt.Errorf("notification UserID must be a recipient phone number when SMS_PROVIDER=twilio")
+	}
+
+	params := &openapi.CreateMessageParams{}
+	params.SetTo(toNumber)
+	params.SetFrom(fromNumber)
+	params.SetBody(notification.Content)
+
+	if err := twilioCreateMessage(accountSid, authToken, params); err != nil {
+		return fmt.Errorf("twilio send failed: %w", err)
+	}
+
+	logger.Info("Twilio sent SMS to %s", toNumber)
 	return nil
 }
 
@@ -116,7 +172,6 @@ func NewInAppChannel() *InAppChannel {
 // @return 发送过程中的错误
 func (c *InAppChannel) Send(notification *model.Notification) error {
 	metrics := metrics.GetMetrics()
-	metrics.IncrementTotal()
 	metrics.IncrementChannelTotal("inapp")
 
 	err := retry.Do(func() error {
@@ -126,12 +181,10 @@ func (c *InAppChannel) Send(notification *model.Notification) error {
 	}, retry.DefaultRetryConfig())
 
 	if err != nil {
-		metrics.IncrementFailed()
 		metrics.IncrementChannelFailed("inapp")
 		return err
 	}
 
-	metrics.IncrementSuccessful()
 	metrics.IncrementChannelSuccessful("inapp")
 	return nil
 }
@@ -155,11 +208,10 @@ func NewSMSChannel() *SMSChannel {
 // @return 发送过程中的错误
 func (c *SMSChannel) Send(notification *model.Notification) error {
 	metrics := metrics.GetMetrics()
-	metrics.IncrementTotal()
 	metrics.IncrementChannelTotal("sms")
 
 	var err error
-	provider := os.Getenv("SMS_PROVIDER")
+	provider := normalizedProvider(os.Getenv("SMS_PROVIDER"))
 	if provider == "twilio" {
 		err = twilioSendSMS(notification)
 	} else {
@@ -171,12 +223,10 @@ func (c *SMSChannel) Send(notification *model.Notification) error {
 	}
 
 	if err != nil {
-		metrics.IncrementFailed()
 		metrics.IncrementChannelFailed("sms")
 		return err
 	}
 
-	metrics.IncrementSuccessful()
 	metrics.IncrementChannelSuccessful("sms")
 	return nil
 }
@@ -200,7 +250,6 @@ func NewSocialMediaChannel() *SocialMediaChannel {
 // @return 发送过程中的错误
 func (c *SocialMediaChannel) Send(notification *model.Notification) error {
 	metrics := metrics.GetMetrics()
-	metrics.IncrementTotal()
 	metrics.IncrementChannelTotal("social")
 
 	err := retry.Do(func() error {
@@ -210,12 +259,10 @@ func (c *SocialMediaChannel) Send(notification *model.Notification) error {
 	}, retry.DefaultRetryConfig())
 
 	if err != nil {
-		metrics.IncrementFailed()
 		metrics.IncrementChannelFailed("social")
 		return err
 	}
 
-	metrics.IncrementSuccessful()
 	metrics.IncrementChannelSuccessful("social")
 	return nil
 }
@@ -274,4 +321,22 @@ func init() {
 	RegisterChannel("inapp", func() Channel { return NewInAppChannel() })
 	RegisterChannel("sms", func() Channel { return NewSMSChannel() })
 	RegisterChannel("social", func() Channel { return NewSocialMediaChannel() })
+}
+
+func normalizedProvider(provider string) string {
+	provider = strings.TrimSpace(strings.ToLower(provider))
+	if provider == "" {
+		return "memory"
+	}
+	return provider
+}
+
+func buildEmailSubject(notification *model.Notification) string {
+	if notification == nil {
+		return "Notification"
+	}
+	if strings.TrimSpace(notification.Type) == "" {
+		return fmt.Sprintf("Notification %s", notification.ID)
+	}
+	return fmt.Sprintf("[%s] Notification %s", strings.ToUpper(notification.Type), notification.ID)
 }

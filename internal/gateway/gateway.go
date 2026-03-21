@@ -7,6 +7,7 @@ import (
 	"github.com/thkx/notification-system/internal/storage"
 	"github.com/thkx/notification-system/pkg/errors"
 	"github.com/thkx/notification-system/pkg/logger"
+	"github.com/thkx/notification-system/pkg/metrics"
 	"github.com/thkx/notification-system/pkg/model"
 	"github.com/thkx/notification-system/pkg/retry"
 )
@@ -54,6 +55,8 @@ func (g *Gateway) SendNotification(notification *model.Notification) error {
 		return err
 	}
 
+	metrics.GetMetrics().IncrementTotal()
+
 	logger.Info("Sending single notification: ID=%s, UserID=%s, Type=%s",
 		notification.ID, notification.UserID, notification.Type)
 
@@ -74,22 +77,23 @@ func (g *Gateway) SendNotification(notification *model.Notification) error {
 		return g.distribution.ProcessNotification(notification)
 	}, retry.DefaultRetryConfig())
 	if err != nil {
-		if g.store != nil {
-			if updateErr := g.store.UpdateStatus(notification.ID, statusFailed); updateErr != nil {
-				logger.Warn("Failed to update notification status to failed: ID=%s, Error=%v", notification.ID, updateErr)
-			}
-		}
-
 		if appErr, ok := err.(*errors.AppError); ok && appErr.Type == errors.ErrorTypeDistribution && appErr.Message == "Duplicate notification" {
 			if g.store != nil {
 				if updateErr := g.store.UpdateStatus(notification.ID, statusDuplicate); updateErr != nil {
 					logger.Warn("Failed to update notification status to duplicate: ID=%s, Error=%v", notification.ID, updateErr)
 				}
 			}
+			metrics.GetMetrics().IncrementSuccessful()
 			logger.Info("Duplicate notification ignored: ID=%s", notification.ID)
 			return nil
 		}
 
+		if g.store != nil {
+			if updateErr := g.store.UpdateStatus(notification.ID, statusFailed); updateErr != nil {
+				logger.Warn("Failed to update notification status to failed: ID=%s, Error=%v", notification.ID, updateErr)
+			}
+		}
+		metrics.GetMetrics().IncrementFailed()
 		wrappedErr := errors.GatewayError("Failed to send notification", fmt.Sprintf("Notification ID: %s", notification.ID), err)
 		logger.Error("Failed to send notification: %v", wrappedErr)
 		return wrappedErr
@@ -101,6 +105,7 @@ func (g *Gateway) SendNotification(notification *model.Notification) error {
 		}
 	}
 
+	metrics.GetMetrics().IncrementSuccessful()
 	logger.Info("Notification sent successfully: ID=%s", notification.ID)
 	return nil
 }

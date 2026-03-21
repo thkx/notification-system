@@ -126,6 +126,41 @@ func TestMemoryStoreListReturnsSortedCopies(t *testing.T) {
 	}
 }
 
+func TestMemoryStoreListSupportsPaginationAndAscendingSort(t *testing.T) {
+	store := NewMemoryStore()
+	now := time.Now().UTC()
+
+	input := []*model.Notification{
+		{ID: "3", UserID: "user-1", Status: "sent", Channels: []string{"email"}, CreatedAt: now.Add(3 * time.Minute)},
+		{ID: "1", UserID: "user-1", Status: "sent", Channels: []string{"email"}, CreatedAt: now.Add(1 * time.Minute)},
+		{ID: "2", UserID: "user-1", Status: "sent", Channels: []string{"email"}, CreatedAt: now.Add(2 * time.Minute)},
+	}
+
+	for _, notification := range input {
+		if err := store.Save(notification); err != nil {
+			t.Fatalf("save notification %s: %v", notification.ID, err)
+		}
+	}
+
+	list, err := store.List(NotificationFilter{
+		UserID: "user-1",
+		Limit:  1,
+		Offset: 1,
+		SortBy: "id",
+		Order:  "asc",
+	})
+	if err != nil {
+		t.Fatalf("list notifications: %v", err)
+	}
+
+	if len(list) != 1 {
+		t.Fatalf("expected 1 notification, got %d", len(list))
+	}
+	if list[0].ID != "2" {
+		t.Fatalf("expected notification ID 2, got %s", list[0].ID)
+	}
+}
+
 func TestMemoryStoreUpdateStatusRejectsMissingNotification(t *testing.T) {
 	store := NewMemoryStore()
 

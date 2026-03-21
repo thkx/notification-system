@@ -68,11 +68,14 @@ func NewMetrics() *Metrics {
 // @param maxQueueUtilization 最大队列使用率(0-1)
 // @param maxProcessingTime 最大处理时间(毫秒)
 // @return Metrics实例
-func NewMetricsWithConfig(maxFailureRate float64, maxQueueUtilization float64, maxProcessingTime int64) *Metrics {
+func NewMetricsWithConfig(maxFailureRate float64, maxQueueUtilization float64, maxProcessingTime int64, maxQueueLength int64) *Metrics {
+	if maxQueueLength <= 0 {
+		maxQueueLength = 1000
+	}
 	return &Metrics{
 		ChannelMetrics:  make(map[string]*ChannelMetric),
 		ProcessingTimes: make([]int64, 0, 10000),
-		MaxQueueLength:  1000,
+		MaxQueueLength:  maxQueueLength,
 		AlertHistory:    make([]Alert, 0, 100),
 		AlertConfig: &AlertConfig{
 			MaxFailureRate:      maxFailureRate,
@@ -313,6 +316,6 @@ func GetMetrics() *Metrics {
 // @param maxFailureRate 最大失败率(0-1)
 // @param maxQueueUtilization 最大队列使用率(0-1)
 // @param maxProcessingTime 最大处理时间(毫秒)
-func InitMetricsWithConfig(maxFailureRate float64, maxQueueUtilization float64, maxProcessingTime int64) {
-	globalMetrics = NewMetricsWithConfig(maxFailureRate, maxQueueUtilization, maxProcessingTime)
+func InitMetricsWithConfig(maxFailureRate float64, maxQueueUtilization float64, maxProcessingTime int64, maxQueueLength int64) {
+	globalMetrics = NewMetricsWithConfig(maxFailureRate, maxQueueUtilization, maxProcessingTime, maxQueueLength)
 }

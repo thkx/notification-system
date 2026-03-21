@@ -228,8 +228,29 @@ func buildNotificationListQuery(filter NotificationFilter) (string, []interface{
 		query += " WHERE " + strings.Join(clauses, " AND ")
 	}
 
-	query += " ORDER BY created_at DESC, updated_at DESC, id ASC"
+	sortBy, order := normalizeFilterOptions(filter)
+	query += " ORDER BY " + sortColumn(sortBy) + " " + strings.ToUpper(order) + ", id ASC"
+
+	if filter.Limit > 0 {
+		query += fmt.Sprintf(" LIMIT $%d", len(args)+1)
+		args = append(args, filter.Limit)
+	}
+	if filter.Offset > 0 {
+		query += fmt.Sprintf(" OFFSET $%d", len(args)+1)
+		args = append(args, filter.Offset)
+	}
 	return query, args
+}
+
+func sortColumn(sortBy string) string {
+	switch sortBy {
+	case "updated_at":
+		return "updated_at"
+	case "id":
+		return "id"
+	default:
+		return "created_at"
+	}
 }
 
 func serializeChannels(channels []string) string {

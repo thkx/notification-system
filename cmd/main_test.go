@@ -9,7 +9,13 @@ import (
 
 func TestBuildApplication(t *testing.T) {
 	cfg := &config.Config{
-		Server: config.ServerConfig{Port: 8080},
+		Server: config.ServerConfig{
+			Port:           8080,
+			ReadTimeoutMs:  5000,
+			WriteTimeoutMs: 10000,
+			IdleTimeoutMs:  60000,
+			MaxBodyBytes:   1 << 20,
+		},
 		Router: config.RouterConfig{
 			BufferSize:   10,
 			WorkerCount:  1,

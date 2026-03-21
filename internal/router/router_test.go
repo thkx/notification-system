@@ -15,10 +15,14 @@ type MockChannelRouter struct {
 	sendCount  atomic.Int32
 	shouldFail bool
 	delay      time.Duration
+	blockCh    chan struct{}
 }
 
 func (m *MockChannelRouter) Send(notification *model.Notification) error {
 	m.sendCount.Add(1)
+	if m.blockCh != nil {
+		<-m.blockCh
+	}
 	if m.delay > 0 {
 		time.Sleep(m.delay)
 	}
@@ -58,8 +62,6 @@ func TestRouterBasicRouting(t *testing.T) {
 		t.Fatalf("Failed to route notification: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
-
 	if mockChannel.sendCount.Load() == 0 {
 		t.Errorf("Expected channel.Send to be called, but it wasn't")
 	}
@@ -77,29 +79,40 @@ func TestRouterQueueCapacity(t *testing.T) {
 	router := NewRouterWithConfig(cfg)
 	defer router.Stop()
 
-	mockChannel := &MockChannelRouter{delay: 50 * time.Millisecond}
+	blockCh := make(chan struct{})
+	mockChannel := &MockChannelRouter{blockCh: blockCh}
 	router.RegisterChannel("mock", mockChannel)
 
-	for i := 0; i < 5; i++ {
+	errCh := make(chan error, 6)
+	for i := 0; i < 6; i++ {
 		notif := &model.Notification{
 			ID:       fmt.Sprintf("test-%d", i),
 			UserID:   "user1",
 			Content:  "test",
 			Channels: []string{"mock"},
 		}
-		if err := router.RouteNotification(notif); err != nil {
-			t.Fatalf("Failed to route notification %d: %v", i, err)
-		}
+		go func(notification *model.Notification) {
+			errCh <- router.RouteNotification(notification)
+		}(notif)
 	}
 
+	time.Sleep(50 * time.Millisecond)
+
 	notif := &model.Notification{
-		ID:       "test-6",
+		ID:       "test-7",
 		UserID:   "user1",
 		Content:  "test",
 		Channels: []string{"mock"},
 	}
 	if err := router.RouteNotification(notif); err == nil {
 		t.Error("Expected error when queue is full, but got nil")
+	}
+
+	close(blockCh)
+	for i := 0; i < 6; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("expected queued notification to succeed, got %v", err)
+		}
 	}
 }
 
@@ -132,12 +145,6 @@ func TestRouterQueueSize(t *testing.T) {
 	if err := router.RouteNotification(notif); err != nil {
 		t.Fatalf("route notification: %v", err)
 	}
-
-	if size := router.GetQueueSize(); size < 0 {
-		t.Errorf("Expected queue size >= 0, got %d", size)
-	}
-
-	time.Sleep(100 * time.Millisecond)
 
 	if finalSize := router.GetQueueSize(); finalSize < 0 {
 		t.Errorf("Expected queue size >= 0 after processing, got %d", finalSize)
@@ -172,8 +179,6 @@ func TestRouterMultipleChannels(t *testing.T) {
 	if err := router.RouteNotification(notification); err != nil {
 		t.Fatalf("Failed to route notification: %v", err)
 	}
-
-	time.Sleep(100 * time.Millisecond)
 
 	if emailChannel.sendCount.Load() == 0 {
 		t.Errorf("Expected email channel to be called")
@@ -261,4 +266,26 @@ func TestRouterStopIsIdempotent(t *testing.T) {
 
 	router.Stop()
 	router.Stop()
+}
+
+func TestRouterReturnsErrorWhenChannelFails(t *testing.T) {
+	router := NewRouterWithConfig(&RouterConfig{
+		BufferSize:  1,
+		WorkerCount: 1,
+		MaxRetries:  0,
+		RetryDelay:  10 * time.Millisecond,
+	})
+	defer router.Stop()
+
+	router.RegisterChannel("mock", &MockChannelRouter{shouldFail: true})
+
+	err := router.RouteNotification(&model.Notification{
+		ID:       "failed-send",
+		UserID:   "user1",
+		Content:  "test",
+		Channels: []string{"mock"},
+	})
+	if err == nil {
+		t.Fatal("expected routing to return channel failure")
+	}
 }

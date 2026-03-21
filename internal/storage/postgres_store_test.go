@@ -23,20 +23,26 @@ func TestBuildNotificationListQuery(t *testing.T) {
 		{
 			name:      "no filters",
 			filter:    NotificationFilter{},
-			wantQuery: "SELECT id, user_id, type, content, channels, priority, scheduled, status, created_at, updated_at FROM notifications ORDER BY created_at DESC, updated_at DESC, id ASC",
+			wantQuery: "SELECT id, user_id, type, content, channels, priority, scheduled, status, created_at, updated_at FROM notifications ORDER BY created_at DESC, id ASC",
 			wantArgs:  []interface{}{},
 		},
 		{
 			name:      "user filter",
 			filter:    NotificationFilter{UserID: "user-1"},
-			wantQuery: "SELECT id, user_id, type, content, channels, priority, scheduled, status, created_at, updated_at FROM notifications WHERE user_id = $1 ORDER BY created_at DESC, updated_at DESC, id ASC",
+			wantQuery: "SELECT id, user_id, type, content, channels, priority, scheduled, status, created_at, updated_at FROM notifications WHERE user_id = $1 ORDER BY created_at DESC, id ASC",
 			wantArgs:  []interface{}{"user-1"},
 		},
 		{
 			name:      "user and status filters",
 			filter:    NotificationFilter{UserID: "user-1", Status: "sent"},
-			wantQuery: "SELECT id, user_id, type, content, channels, priority, scheduled, status, created_at, updated_at FROM notifications WHERE user_id = $1 AND status = $2 ORDER BY created_at DESC, updated_at DESC, id ASC",
+			wantQuery: "SELECT id, user_id, type, content, channels, priority, scheduled, status, created_at, updated_at FROM notifications WHERE user_id = $1 AND status = $2 ORDER BY created_at DESC, id ASC",
 			wantArgs:  []interface{}{"user-1", "sent"},
+		},
+		{
+			name:      "pagination and sort",
+			filter:    NotificationFilter{UserID: "user-1", SortBy: "updatedAt", Order: "asc", Limit: 10, Offset: 5},
+			wantQuery: "SELECT id, user_id, type, content, channels, priority, scheduled, status, created_at, updated_at FROM notifications WHERE user_id = $1 ORDER BY updated_at ASC, id ASC LIMIT $2 OFFSET $3",
+			wantArgs:  []interface{}{"user-1", 10, 5},
 		},
 	}
 

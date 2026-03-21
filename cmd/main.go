@@ -56,7 +56,10 @@ func main() {
 }
 
 func run() error {
-	cfg := config.LoadConfig()
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
 	app, err := buildApplication(cfg)
 	if err != nil {
 		return err
@@ -113,6 +116,7 @@ func buildApplication(cfg *config.Config) (*application, error) {
 		cfg.Metrics.MaxFailureRate,
 		cfg.Metrics.MaxQueueUtilization,
 		cfg.Metrics.MaxProcessingTime,
+		int64(cfg.Router.BufferSize),
 	)
 
 	container := di.NewContainer()
@@ -170,7 +174,7 @@ func buildApplication(cfg *config.Config) (*application, error) {
 	notificationGateway := gateway.NewGateway(dist, store)
 	container.Register("gateway", notificationGateway)
 
-	httpServer := api.NewServer(notificationGateway, cfg.Server.Port)
+	httpServer := api.NewServer(notificationGateway, cfg.Server, cfg.Security)
 	container.Register("httpServer", httpServer)
 
 	orderService := services.NewOrderService(notificationGateway)
@@ -201,8 +205,7 @@ func newStore(cfg *config.Config) (storage.NotificationStore, error) {
 
 	pgStore, err := storage.NewPostgresStore(cfg.Store.DSN)
 	if err != nil {
-		fmt.Printf("Failed to initialize PostgreSQL store: %v, falling back to memory store\n", err)
-		return storage.NewMemoryStore(), nil
+		return nil, fmt.Errorf("initialize PostgreSQL store: %w", err)
 	}
 
 	return pgStore, nil
@@ -242,6 +245,7 @@ func printStartupSummary(app *application) {
 	fmt.Printf("HTTP server running on port %d\n", app.config.Server.Port)
 	fmt.Printf("Registered channels: %s\n", strings.Join(app.registeredChannels, ", "))
 	fmt.Printf("Storage backend: %s\n", app.config.Store.Type)
+	fmt.Printf("API key required: %t\n", app.config.Security.RequireAPIKey)
 	fmt.Println("API endpoints:")
 	fmt.Println("  GET  /health - Health check")
 	fmt.Println("  POST /api/notifications - Send single notification")

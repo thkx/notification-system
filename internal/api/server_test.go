@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
+	"github.com/thkx/notification-system/config"
 	"github.com/thkx/notification-system/internal/distribution"
 	"github.com/thkx/notification-system/internal/gateway"
 	"github.com/thkx/notification-system/internal/router"
@@ -15,6 +16,10 @@ import (
 )
 
 func newTestServer() *Server {
+	return newConfiguredTestServer(config.SecurityConfig{})
+}
+
+func newConfiguredTestServer(securityCfg config.SecurityConfig) *Server {
 	routerCfg := &router.RouterConfig{
 		BufferSize:  10,
 		WorkerCount: 1,
@@ -22,9 +27,28 @@ func newTestServer() *Server {
 		RetryDelay:  1000,
 	}
 	notificationRouter := router.NewRouterWithConfig(routerCfg)
+	notificationRouter.RegisterChannel("email", &mockChannel{})
+	notificationRouter.RegisterChannel("sms", &mockChannel{})
+	notificationRouter.RegisterChannel("inapp", &mockChannel{})
 	dist := distribution.NewDistribution(notificationRouter)
 	gw := gateway.NewGateway(dist, storage.NewMemoryStore())
-	return NewServer(gw, 8080)
+	return NewServer(gw, config.ServerConfig{
+		Port:           8080,
+		ReadTimeoutMs:  5000,
+		WriteTimeoutMs: 10000,
+		IdleTimeoutMs:  60000,
+		MaxBodyBytes:   1 << 20,
+	}, securityCfg)
+}
+
+type mockChannel struct{}
+
+func (m *mockChannel) Send(notification *model.Notification) error {
+	return nil
+}
+
+func (m *mockChannel) Name() string {
+	return "mock"
 }
 
 // TestBroadcastSingleNotification 测试单个通知的广播
@@ -212,6 +236,54 @@ func TestListNotificationsWithFilter(t *testing.T) {
 	}
 }
 
+func TestListNotificationsSupportsPaginationAndSorting(t *testing.T) {
+	server := newTestServer()
+
+	notifications := []*model.Notification{
+		{ID: "3", UserID: "user-1", Type: "info", Content: "three", Channels: []string{"email"}},
+		{ID: "1", UserID: "user-1", Type: "info", Content: "one", Channels: []string{"email"}},
+		{ID: "2", UserID: "user-1", Type: "info", Content: "two", Channels: []string{"email"}},
+	}
+
+	for _, notification := range notifications {
+		if err := server.gateway.SendNotification(notification); err != nil {
+			t.Fatalf("seed notification %s: %v", notification.ID, err)
+		}
+	}
+
+	req := httptest.NewRequest("GET", "/api/notifications?userId=user-1&sortBy=id&order=asc&limit=1&offset=1", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
+	}
+
+	var output []model.Notification
+	if err := json.NewDecoder(w.Body).Decode(&output); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	if len(output) != 1 {
+		t.Fatalf("expected 1 notification, got %d", len(output))
+	}
+	if output[0].ID != "2" {
+		t.Fatalf("expected notification 2, got %s", output[0].ID)
+	}
+}
+
+func TestListNotificationsRejectsInvalidPagination(t *testing.T) {
+	server := newTestServer()
+
+	req := httptest.NewRequest("GET", "/api/notifications?limit=-1", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected status 400, got %d", w.Code)
+	}
+}
+
 func TestSendBatchNotificationsRejectsInvalidBody(t *testing.T) {
 	server := newTestServer()
 
@@ -222,5 +294,36 @@ func TestSendBatchNotificationsRejectsInvalidBody(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected status 400, got %d", w.Code)
+	}
+}
+
+func TestAPIRejectsUnauthorizedRequestWhenAPIKeyRequired(t *testing.T) {
+	server := newConfiguredTestServer(config.SecurityConfig{
+		RequireAPIKey: true,
+		APIKey:        "secret",
+	})
+
+	req := httptest.NewRequest("GET", "/api/notifications", nil)
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected status 401, got %d", w.Code)
+	}
+}
+
+func TestAPIAcceptsAuthorizedRequestWhenAPIKeyRequired(t *testing.T) {
+	server := newConfiguredTestServer(config.SecurityConfig{
+		RequireAPIKey: true,
+		APIKey:        "secret",
+	})
+
+	req := httptest.NewRequest("GET", "/api/notifications", nil)
+	req.Header.Set("X-API-Key", "secret")
+	w := httptest.NewRecorder()
+	server.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status 200, got %d", w.Code)
 	}
 }

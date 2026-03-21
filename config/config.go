@@ -4,15 +4,25 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"sync"
-	"time"
+	"strings"
 )
 
 // ============ 分离的配置结构体 ============
 
 // ServerConfig 服务器配置
 type ServerConfig struct {
-	Port int `json:"port"` // 服务器端口，默认8080
+	Port           int      `json:"port"`           // 服务器端口，默认8080
+	ReadTimeoutMs  int      `json:"readTimeoutMs"`  // 读超时，默认5000ms
+	WriteTimeoutMs int      `json:"writeTimeoutMs"` // 写超时，默认10000ms
+	IdleTimeoutMs  int      `json:"idleTimeoutMs"`  // 空闲超时，默认60000ms
+	MaxBodyBytes   int64    `json:"maxBodyBytes"`   // 请求体上限，默认1MB
+	AllowedOrigins []string `json:"allowedOrigins"` // 允许的跨站WebSocket来源
+}
+
+// SecurityConfig 安全配置
+type SecurityConfig struct {
+	RequireAPIKey bool   `json:"requireApiKey"` // 是否要求API Key
+	APIKey        string `json:"apiKey"`        // API Key，可被环境变量覆盖
 }
 
 // RouterConfig 路由器配置
@@ -57,6 +67,7 @@ type StoreConfig struct {
 // Config 系统总配置结构
 type Config struct {
 	Server       ServerConfig       `json:"server"`       // 服务器配置
+	Security     SecurityConfig     `json:"security"`     // 安全配置
 	Router       RouterConfig       `json:"router"`       // 路由器配置
 	Channels     ChannelsConfig     `json:"channels"`     // 渠道配置
 	Metrics      MetricsConfig      `json:"metrics"`      // 性能监控配置
@@ -73,6 +84,9 @@ func (c *Config) Validate() error {
 	if err := c.Server.Validate(); err != nil {
 		return fmt.Errorf("server config validation failed: %w", err)
 	}
+	if err := c.Security.Validate(); err != nil {
+		return fmt.Errorf("security config validation failed: %w", err)
+	}
 	if err := c.Router.Validate(); err != nil {
 		return fmt.Errorf("router config validation failed: %w", err)
 	}
@@ -84,6 +98,14 @@ func (c *Config) Validate() error {
 	}
 	if err := c.Store.Validate(); err != nil {
 		return fmt.Errorf("storage config validation failed: %w", err)
+	}
+	return nil
+}
+
+// Validate 验证安全配置
+func (s *SecurityConfig) Validate() error {
+	if s.RequireAPIKey && strings.TrimSpace(s.APIKey) == "" {
+		return fmt.Errorf("requireApiKey is true but apiKey is empty")
 	}
 	return nil
 }
@@ -106,6 +128,18 @@ func (s *StoreConfig) Validate() error {
 func (s *ServerConfig) Validate() error {
 	if s.Port <= 0 || s.Port > 65535 {
 		return fmt.Errorf("invalid port: %d, must be between 1 and 65535", s.Port)
+	}
+	if s.ReadTimeoutMs <= 0 {
+		return fmt.Errorf("readTimeoutMs must be greater than 0, got %d", s.ReadTimeoutMs)
+	}
+	if s.WriteTimeoutMs <= 0 {
+		return fmt.Errorf("writeTimeoutMs must be greater than 0, got %d", s.WriteTimeoutMs)
+	}
+	if s.IdleTimeoutMs <= 0 {
+		return fmt.Errorf("idleTimeoutMs must be greater than 0, got %d", s.IdleTimeoutMs)
+	}
+	if s.MaxBodyBytes <= 0 {
+		return fmt.Errorf("maxBodyBytes must be greater than 0, got %d", s.MaxBodyBytes)
 	}
 	return nil
 }
@@ -175,17 +209,9 @@ func (d *DistributionConfig) Validate() error {
 	return nil
 }
 
-// 全局配置实例
-var (
-	globalConfig *Config
-	configMutex  sync.RWMutex
-	configPath   string
-	watchOnce    sync.Once
-)
-
 // LoadConfig 加载系统配置
 // @return 配置实例
-func LoadConfig() *Config {
+func LoadConfig() (*Config, error) {
 	// 尝试从环境变量获取配置文件路径
 	env := os.Getenv("NOTIFICATION_ENV")
 	if env == "" {
@@ -199,83 +225,61 @@ func LoadConfig() *Config {
 		configFile = "config.json"
 	}
 
-	configPath = configFile
 	return LoadConfigFromFile(configFile)
 }
 
 // LoadConfigFromFile 从文件加载配置
 // @param filePath 配置文件路径
 // @return 配置实例
-func LoadConfigFromFile(filePath string) *Config {
-	configMutex.Lock()
-	defer configMutex.Unlock()
-
+func LoadConfigFromFile(filePath string) (*Config, error) {
 	// 尝试从文件加载配置
 	file, err := os.Open(filePath)
 	if err == nil {
 		defer file.Close()
-		var config Config
-		if err := json.NewDecoder(file).Decode(&config); err == nil {
+		config := *getDefaultConfig()
+		if decodeErr := json.NewDecoder(file).Decode(&config); decodeErr == nil {
+			applyEnvOverrides(&config)
 			// 验证配置的合法性
 			if err := config.Validate(); err != nil {
-				fmt.Printf("Config validation failed: %v, using default config\n", err)
-				config = *getDefaultConfig()
+				return nil, fmt.Errorf("validate config %s: %w", filePath, err)
 			}
-			globalConfig = &config
-			watchOnce.Do(func() {
-				go monitorConfigChanges(filePath)
-			})
-			return globalConfig
+			return &config, nil
+		} else {
+			return nil, fmt.Errorf("decode config %s: %w", filePath, decodeErr)
 		}
 	}
 
-	// 如果文件加载失败，返回默认配置
+	if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("open config %s: %w", filePath, err)
+	}
+
+	// 如果文件不存在，返回默认配置
 	config := getDefaultConfig()
-	globalConfig = config
-	return config
-}
-
-// GetConfig 获取全局配置实例
-// @return 全局配置实例
-func GetConfig() *Config {
-	configMutex.RLock()
-	cfg := globalConfig
-	configMutex.RUnlock()
-
-	if cfg == nil {
-		return LoadConfig()
+	applyEnvOverrides(config)
+	if err := config.Validate(); err != nil {
+		return nil, fmt.Errorf("validate default config: %w", err)
 	}
-	return cfg
+	return config, nil
 }
 
-// monitorConfigChanges 监控配置文件变化
-// @param filePath 配置文件路径
-func monitorConfigChanges(filePath string) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
+func applyEnvOverrides(cfg *Config) {
+	if cfg == nil {
+		return
+	}
 
-	lastModTime := getFileModTime(filePath)
+	if apiKey := strings.TrimSpace(os.Getenv("NOTIFICATION_API_KEY")); apiKey != "" {
+		cfg.Security.APIKey = apiKey
+	}
 
-	for range ticker.C {
-		currentModTime := getFileModTime(filePath)
-		if currentModTime.After(lastModTime) {
-			// 配置文件发生变化，重新加载
-			fmt.Printf("Config file %s changed, reloading...\n", filePath)
-			LoadConfigFromFile(filePath)
-			lastModTime = currentModTime
+	if allowedOrigins := strings.TrimSpace(os.Getenv("NOTIFICATION_ALLOWED_ORIGINS")); allowedOrigins != "" {
+		parts := strings.Split(allowedOrigins, ",")
+		cfg.Server.AllowedOrigins = cfg.Server.AllowedOrigins[:0]
+		for _, part := range parts {
+			if origin := strings.TrimSpace(part); origin != "" {
+				cfg.Server.AllowedOrigins = append(cfg.Server.AllowedOrigins, origin)
+			}
 		}
 	}
-}
-
-// getFileModTime 获取文件的修改时间
-// @param filePath 文件路径
-// @return 文件修改时间
-func getFileModTime(filePath string) time.Time {
-	info, err := os.Stat(filePath)
-	if err != nil {
-		return time.Time{}
-	}
-	return info.ModTime()
 }
 
 // getDefaultConfig 获取默认配置
@@ -283,7 +287,15 @@ func getFileModTime(filePath string) time.Time {
 func getDefaultConfig() *Config {
 	cfg := &Config{
 		Server: ServerConfig{
-			Port: 8080, // 默认端口为8080
+			Port:           8080,    // 默认端口为8080
+			ReadTimeoutMs:  5000,    // 默认读超时5秒
+			WriteTimeoutMs: 10000,   // 默认写超时10秒
+			IdleTimeoutMs:  60000,   // 默认空闲超时60秒
+			MaxBodyBytes:   1 << 20, // 默认请求体上限1MB
+		},
+		Security: SecurityConfig{
+			RequireAPIKey: false, // 开发环境默认不强制鉴权
+			APIKey:        "",
 		},
 		Router: RouterConfig{
 			BufferSize:   1000, // 默认队列缓冲大小1000

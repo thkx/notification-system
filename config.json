@@ -1,6 +1,15 @@
 {
   "server": {
-    "port": 8080
+    "port": 8080,
+    "readTimeoutMs": 5000,
+    "writeTimeoutMs": 10000,
+    "idleTimeoutMs": 60000,
+    "maxBodyBytes": 1048576,
+    "allowedOrigins": []
+  },
+  "security": {
+    "requireApiKey": false,
+    "apiKey": ""
   },
   "router": {
     "bufferSize": 1000,

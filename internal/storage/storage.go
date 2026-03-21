@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,6 +14,10 @@ import (
 type NotificationFilter struct {
 	UserID string
 	Status string
+	Limit  int
+	Offset int
+	SortBy string
+	Order  string
 }
 
 type NotificationStore interface {
@@ -110,18 +115,24 @@ func (s *MemoryStore) List(filter NotificationFilter) ([]*model.Notification, er
 	}
 	s.mutex.RUnlock()
 
+	sortBy, sortOrder := normalizeFilterOptions(filter)
 	sort.Slice(matches, func(i, j int) bool {
-		if !matches[i].CreatedAt.Equal(matches[j].CreatedAt) {
-			return matches[i].CreatedAt.After(matches[j].CreatedAt)
+		left, right := matches[i], matches[j]
+
+		compare := compareNotifications(left, right, sortBy)
+		if compare == 0 {
+			compare = compareNotifications(left, right, "id")
 		}
-		if !matches[i].UpdatedAt.Equal(matches[j].UpdatedAt) {
-			return matches[i].UpdatedAt.After(matches[j].UpdatedAt)
+		if sortOrder == "asc" {
+			return compare < 0
 		}
-		return matches[i].ID < matches[j].ID
+		return compare > 0
 	})
 
-	result := make([]*model.Notification, 0, len(matches))
-	for _, notification := range matches {
+	start, end := paginate(len(matches), filter.Offset, filter.Limit)
+
+	result := make([]*model.Notification, 0, end-start)
+	for _, notification := range matches[start:end] {
 		result = append(result, cloneNotification(notification))
 	}
 
@@ -139,4 +150,66 @@ func cloneNotification(notification *model.Notification) *model.Notification {
 	}
 
 	return &notificationCopy
+}
+
+func normalizeFilterOptions(filter NotificationFilter) (sortBy string, order string) {
+	sortBy = strings.ToLower(strings.TrimSpace(filter.SortBy))
+	switch sortBy {
+	case "createdat", "created_at":
+		sortBy = "created_at"
+	case "updatedat", "updated_at":
+		sortBy = "updated_at"
+	case "id":
+		sortBy = "id"
+	default:
+		sortBy = "created_at"
+	}
+
+	order = strings.ToLower(strings.TrimSpace(filter.Order))
+	if order != "asc" {
+		order = "desc"
+	}
+
+	return sortBy, order
+}
+
+func paginate(total int, offset int, limit int) (start int, end int) {
+	if offset < 0 {
+		offset = 0
+	}
+	if offset > total {
+		offset = total
+	}
+
+	start = offset
+	if limit <= 0 {
+		return start, total
+	}
+
+	end = start + limit
+	if end > total {
+		end = total
+	}
+	return start, end
+}
+
+func compareNotifications(left, right *model.Notification, sortBy string) int {
+	switch sortBy {
+	case "updated_at":
+		return compareTimes(left.UpdatedAt, right.UpdatedAt)
+	case "id":
+		return strings.Compare(left.ID, right.ID)
+	default:
+		return compareTimes(left.CreatedAt, right.CreatedAt)
+	}
+}
+
+func compareTimes(left, right time.Time) int {
+	if left.Before(right) {
+		return -1
+	}
+	if left.After(right) {
+		return 1
+	}
+	return 0
 }

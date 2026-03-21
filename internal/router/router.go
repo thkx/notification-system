@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,7 +26,7 @@ type RouterConfig struct {
 // Router 通知路由器，负责管理通知渠道和路由通知
 type Router struct {
 	channels          map[string]channels.Channel // 渠道映射，键为渠道名称，值为渠道实例
-	notificationQueue chan *model.Notification    // 通知队列，使用带缓冲的通道
+	notificationQueue chan queuedNotification     // 通知队列，使用带缓冲的通道
 	stopChan          chan struct{}               // 停止信号通道
 	config            *RouterConfig               // 路由器配置
 	queueSize         atomic.Int64                // 当前队列大小
@@ -33,6 +34,11 @@ type Router struct {
 	stopped           atomic.Bool                 // 是否已停止接收新通知
 	workerWg          sync.WaitGroup              // 工作协程等待组
 	stopOnce          sync.Once                   // 确保停止逻辑只执行一次
+}
+
+type queuedNotification struct {
+	notification *model.Notification
+	resultCh     chan error
 }
 
 func defaultConfig() *RouterConfig {
@@ -77,7 +83,7 @@ func NewRouterWithConfig(cfg *RouterConfig) *Router {
 
 	router := &Router{
 		channels:          make(map[string]channels.Channel),
-		notificationQueue: make(chan *model.Notification, cfg.BufferSize),
+		notificationQueue: make(chan queuedNotification, cfg.BufferSize),
 		stopChan:          make(chan struct{}),
 		config:            cfg,
 	}
@@ -101,6 +107,11 @@ func (r *Router) RouteNotification(notification *model.Notification) error {
 		return errors.RouterError("Invalid notification", "notification cannot be nil", nil)
 	}
 
+	job := queuedNotification{
+		notification: notification,
+		resultCh:     make(chan error, 1),
+	}
+
 	retryDelay := r.config.RetryDelay
 	for attempt := 0; attempt <= r.config.MaxRetries; attempt++ {
 		if err := r.stoppedError(); err != nil {
@@ -110,10 +121,10 @@ func (r *Router) RouteNotification(notification *model.Notification) error {
 		select {
 		case <-r.stopChan:
 			return r.routerStoppedError(notification.ID)
-		case r.notificationQueue <- notification:
+		case r.notificationQueue <- job:
 			queueSize := r.queueSize.Add(1)
 			metrics.GetMetrics().UpdateQueueLength(queueSize)
-			return nil
+			return <-job.resultCh
 		default:
 			if attempt < r.config.MaxRetries {
 				exponentialDelay := retryDelay * time.Duration(1<<uint(attempt))
@@ -142,8 +153,9 @@ func (r *Router) processQueue() {
 		select {
 		case <-r.stopChan:
 			return
-		case notification := <-r.notificationQueue:
-			if notification == nil {
+		case job := <-r.notificationQueue:
+			if job.notification == nil {
+				job.resultCh <- errors.RouterError("Invalid notification", "notification cannot be nil", nil)
 				continue
 			}
 
@@ -151,17 +163,23 @@ func (r *Router) processQueue() {
 			metrics.GetMetrics().UpdateQueueLength(queueSize)
 
 			r.processingCount.Add(1)
-			r.processNotification(notification)
+			job.resultCh <- r.processNotification(job.notification)
 			r.processingCount.Add(-1)
 		}
 	}
 }
 
 // processNotification 处理单个通知，并记录性能指标
-func (r *Router) processNotification(notification *model.Notification) {
+func (r *Router) processNotification(notification *model.Notification) error {
 	startTime := time.Now()
 
 	var notificationWg sync.WaitGroup
+	var (
+		errorMutex sync.Mutex
+		errs       []string
+	)
+	attemptedChannels := 0
+
 	for _, channelName := range notification.Channels {
 		channel, ok := r.channels[channelName]
 		if !ok {
@@ -169,12 +187,16 @@ func (r *Router) processNotification(notification *model.Notification) {
 			continue
 		}
 
+		attemptedChannels++
 		notificationWg.Add(1)
 		go func(c channels.Channel, chName string) {
 			defer notificationWg.Done()
 
 			if err := c.Send(notification); err != nil {
 				logger.Error("Failed to send notification %s via channel %s: %v", notification.ID, chName, err)
+				errorMutex.Lock()
+				errs = append(errs, fmt.Sprintf("%s: %v", chName, err))
+				errorMutex.Unlock()
 			}
 
 			duration := time.Since(startTime).Milliseconds()
@@ -191,6 +213,22 @@ func (r *Router) processNotification(notification *model.Notification) {
 	}
 
 	notificationWg.Wait()
+	if attemptedChannels == 0 {
+		return errors.RouterError(
+			"No registered channels available",
+			fmt.Sprintf("Notification ID: %s, requested channels: %v", notification.ID, notification.Channels),
+			nil,
+		)
+	}
+	if len(errs) > 0 {
+		return errors.RouterError(
+			"Notification delivery failed",
+			fmt.Sprintf("Notification ID: %s, errors: %s", notification.ID, strings.Join(errs, "; ")),
+			nil,
+		)
+	}
+
+	return nil
 }
 
 // GetQueueSize 获取通知队列的大小

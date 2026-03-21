@@ -6,8 +6,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
+	"github.com/thkx/notification-system/config"
 	"github.com/thkx/notification-system/internal/gateway"
 	"github.com/thkx/notification-system/internal/storage"
 	"github.com/thkx/notification-system/pkg/model"
@@ -18,33 +23,43 @@ import (
 
 // Server HTTP服务器结构
 type Server struct {
-	gateway      *gateway.Gateway
-	router       *mux.Router
-	port         int
-	httpServer   *http.Server
-	upgrader     websocket.Upgrader
-	clients      map[*websocket.Conn]bool
-	clientsMutex sync.RWMutex
+	gateway        *gateway.Gateway
+	router         *mux.Router
+	port           int
+	httpServer     *http.Server
+	upgrader       websocket.Upgrader
+	clients        map[*websocket.Conn]bool
+	clientsMutex   sync.RWMutex
+	maxBodyBytes   int64
+	allowedOrigins map[string]struct{}
+	apiKey         string
+	requireAPIKey  bool
 }
 
 // NewServer 创建一个新的HTTP服务器实例
-func NewServer(gateway *gateway.Gateway, port int) *Server {
+func NewServer(gateway *gateway.Gateway, serverCfg config.ServerConfig, securityCfg config.SecurityConfig) *Server {
 	r := mux.NewRouter()
 	server := &Server{
 		gateway: gateway,
 		router:  r,
-		port:    port,
+		port:    serverCfg.Port,
 		upgrader: websocket.Upgrader{
-			CheckOrigin: func(r *http.Request) bool {
-				return true // 允许所有来源的WebSocket连接
-			},
+			CheckOrigin: nil,
 		},
-		clients: make(map[*websocket.Conn]bool),
+		clients:        make(map[*websocket.Conn]bool),
+		maxBodyBytes:   serverCfg.MaxBodyBytes,
+		allowedOrigins: buildOriginSet(serverCfg.AllowedOrigins),
+		apiKey:         strings.TrimSpace(securityCfg.APIKey),
+		requireAPIKey:  securityCfg.RequireAPIKey,
 	}
+	server.upgrader.CheckOrigin = server.checkOrigin
 	server.setupRoutes()
 	server.httpServer = &http.Server{
-		Addr:    fmt.Sprintf(":%d", port),
-		Handler: server.router,
+		Addr:         fmt.Sprintf(":%d", serverCfg.Port),
+		Handler:      server.router,
+		ReadTimeout:  time.Duration(serverCfg.ReadTimeoutMs) * time.Millisecond,
+		WriteTimeout: time.Duration(serverCfg.WriteTimeoutMs) * time.Millisecond,
+		IdleTimeout:  time.Duration(serverCfg.IdleTimeoutMs) * time.Millisecond,
 	}
 	return server
 }
@@ -56,6 +71,7 @@ func (s *Server) setupRoutes() {
 
 	// 通知相关API
 	notificationRoutes := s.router.PathPrefix("/api/notifications").Subrouter()
+	notificationRoutes.Use(s.authMiddleware)
 	{
 		notificationRoutes.HandleFunc("", s.sendNotification).Methods("POST")
 		notificationRoutes.HandleFunc("", s.listNotifications).Methods("GET")
@@ -64,7 +80,7 @@ func (s *Server) setupRoutes() {
 	}
 
 	// WebSocket路由
-	s.router.HandleFunc("/ws", s.handleWebSocket).Methods("GET")
+	s.router.Handle("/ws", s.authMiddleware(http.HandlerFunc(s.handleWebSocket))).Methods("GET")
 }
 
 // Start 启动HTTP服务器
@@ -79,6 +95,7 @@ func (s *Server) Start() error {
 
 // Shutdown 优雅关闭HTTP服务器
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.closeAllClients()
 	return s.httpServer.Shutdown(ctx)
 }
 
@@ -93,7 +110,7 @@ func (s *Server) healthCheck(w http.ResponseWriter, r *http.Request) {
 // sendNotification 发送单个通知的API接口
 func (s *Server) sendNotification(w http.ResponseWriter, r *http.Request) {
 	var notification model.Notification
-	if err := json.NewDecoder(r.Body).Decode(&notification); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, s.maxBodyBytes)).Decode(&notification); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
 		return
 	}
@@ -112,7 +129,7 @@ func (s *Server) sendNotification(w http.ResponseWriter, r *http.Request) {
 // sendBatchNotifications 批量发送通知的API接口
 func (s *Server) sendBatchNotifications(w http.ResponseWriter, r *http.Request) {
 	var notifications []*model.Notification
-	if err := json.NewDecoder(r.Body).Decode(&notifications); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, s.maxBodyBytes)).Decode(&notifications); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
 		return
 	}
@@ -178,6 +195,25 @@ func (s *Server) listNotifications(w http.ResponseWriter, r *http.Request) {
 	filter := storage.NotificationFilter{
 		UserID: query.Get("userId"),
 		Status: query.Get("status"),
+		SortBy: query.Get("sortBy"),
+		Order:  query.Get("order"),
+	}
+
+	if limit := strings.TrimSpace(query.Get("limit")); limit != "" {
+		parsedLimit, err := strconv.Atoi(limit)
+		if err != nil || parsedLimit < 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "limit must be a non-negative integer"})
+			return
+		}
+		filter.Limit = parsedLimit
+	}
+	if offset := strings.TrimSpace(query.Get("offset")); offset != "" {
+		parsedOffset, err := strconv.Atoi(offset)
+		if err != nil || parsedOffset < 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "offset must be a non-negative integer"})
+			return
+		}
+		filter.Offset = parsedOffset
 	}
 
 	notifications, err := s.gateway.ListNotifications(filter)
@@ -217,6 +253,57 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	// 启动goroutine处理客户端消息
 	go s.handleClient(conn)
+}
+
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.requireAPIKey {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if !s.isAuthorized(r) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) isAuthorized(r *http.Request) bool {
+	if !s.requireAPIKey {
+		return true
+	}
+
+	apiKey := strings.TrimSpace(r.Header.Get("X-API-Key"))
+	if apiKey == "" {
+		authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+		if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+			apiKey = strings.TrimSpace(authHeader[7:])
+		}
+	}
+
+	return apiKey != "" && apiKey == s.apiKey
+}
+
+func (s *Server) checkOrigin(r *http.Request) bool {
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	if origin == "" {
+		return true
+	}
+
+	originURL, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+
+	if strings.EqualFold(originURL.Host, r.Host) {
+		return true
+	}
+
+	_, ok := s.allowedOrigins[origin]
+	return ok
 }
 
 // handleClient 处理单个WebSocket客户端连接
@@ -290,6 +377,25 @@ func (s *Server) clientCount() int {
 	s.clientsMutex.RLock()
 	defer s.clientsMutex.RUnlock()
 	return len(s.clients)
+}
+
+func (s *Server) closeAllClients() {
+	clients := s.snapshotClients()
+	for _, client := range clients {
+		s.removeClient(client)
+	}
+}
+
+func buildOriginSet(origins []string) map[string]struct{} {
+	result := make(map[string]struct{}, len(origins))
+	for _, origin := range origins {
+		trimmed := strings.TrimSpace(origin)
+		if trimmed == "" {
+			continue
+		}
+		result[trimmed] = struct{}{}
+	}
+	return result
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
